@@ -6,7 +6,7 @@ A local Gradio workbench for SeedVR2. The inference engine and task manager run 
 
 ---
 
-## 1. Main features / 主要功能
+## 1. Main features
 
 ### In-process inference and resident models
 
