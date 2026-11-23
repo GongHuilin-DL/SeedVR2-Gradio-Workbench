@@ -1,127 +1,59 @@
-
-# ==================================================
 # Python
-# ==================================================
-
 __pycache__/
 *.py[cod]
-*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
 
-*.so
-*.pyd
-
-.Python
-build/
-dist/
-wheels/
-*.egg-info/
-.eggs/
-
-# ==================================================
-# Virtual Environments
-# ==================================================
-
+# Virtual environments and local secrets
 .venv/
 venv/
 env/
-ENV/
-
-# Conda
-.conda/
-
-# ==================================================
-# IDE and Editors
-# ==================================================
-
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# ==================================================
-# Local Environment
-# ==================================================
-
 .env
 .env.*
 !.env.example
 
-# ==================================================
-# SeedVR2 Local Configuration
-# ==================================================
-
-seedvr2_gradio_config.json
-seedvr2_gradio_history.json
-
-*.corrupt-*
-
-# ==================================================
-# Model Weights and Checkpoints
-# ==================================================
-
-models/
-checkpoints/
-weights/
-
-*.safetensors
-*.ckpt
-*.pt
-*.pth
-*.bin
-*.gguf
-*.onnx
-
-# ==================================================
-# Input and Output Media
-# ==================================================
-
-inputs/
-outputs/
-input/
-output/
-
-*.mp4
-*.mkv
-*.avi
-*.mov
-*.webm
-*.flv
-*.wmv
-
-# ==================================================
-# Logs and Temporary Files
-# ==================================================
-
-*.log
-logs/
-tmp/
-temp/
-.cache/
-
-# Gradio cache
-gradio_cached_examples/
-flagged/
-
-# ==================================================
-# Benchmark Results
-# ==================================================
-
-benchmark_results/
-benchmark_outputs/
-*.csv
-
-# ==================================================
-# OS Generated Files
-# ==================================================
-
+# Editors / operating systems
+.vscode/
+.idea/
+*.swp
+*.swo
 .DS_Store
 Thumbs.db
 Desktop.ini
 
-# ==================================================
-# Local Runtime Files
-# ==================================================
+# Local application state
+seedvr2_gradio_config.json
+seedvr2_gradio_history.json
+seedvr2_gradio_history.json.corrupt-*
+*.corrupt-*
+.gradio/
+gradio_cached_examples/
 
-*.pid
-*.lock
+# Generated outputs, checkpoints and logs
+outputs/
+output/
+checkpoints/
+logs/
+*.log
+*.partial
+*.partial.*
+*.assembling
+*.assembling.*
+concat_list.txt
+
+# Model weights / large local assets
+models/
+**/*.safetensors
+**/*.gguf
+**/*.pth
+**/*.pt
+**/*.ckpt
+**/*.bin
+**/*.onnx
+
+# Local media and benchmark artifacts (keep source files in normal folders)
+inputs/
+input/
+benchmark/
+benchmarks/

@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""SeedVR2 Gradio Workbench for inference_cli.py
+"""SeedVR2 Gradio Workbench: in-process inference, resident models and checkpoints.
 
-Place this file beside inference_cli.py (inside the SeedVR2 project root),
-then run: python seedvr2_gradio.py
-
-The app deliberately delegates inference to the uploaded CLI. It does not
-reimplement the SeedVR2 model pipeline.
+Place this file, seedvr2_runtime.py and inference_cli.py in the SeedVR2 project
+root (beside src/), then run: python seedvr2_gradio.py
 """
 from __future__ import annotations
 
@@ -36,11 +33,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import gradio as gr
 
-try:
-    import psutil  # type: ignore
-except Exception:
-    psutil = None
-
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "seedvr2_gradio_config.json"
 HISTORY_PATH = APP_DIR / "seedvr2_gradio_history.json"
@@ -56,6 +48,9 @@ DEFAULTS: Dict[str, Any] = {
     "use_10bit": False,
     "model_dir": "",
     "dit_model": "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
+    "dit_model_path": "",
+    "vae_model": "",
+    "keep_models_resident": True,
     "resolution": 1080,
     "max_resolution": 0,
     "batch_size": 5,
@@ -102,7 +97,10 @@ FIELD_SPECS = [
     ("video_backend", "视频编码后端", "dropdown", {"choices": ["opencv", "ffmpeg"], "info": "视频输出编码后端。OpenCV 通常兼容性更好；FFmpeg 可配合 10-bit x265。"}),
     ("use_10bit", "10-bit 视频输出", "checkbox", {"info": "仅在 video_backend=ffmpeg 时有效"}),
     ("model_dir", "模型目录（留空使用 CLI 默认）", "textbox", {"info": "CLI --model_dir。留空时使用 CLI 默认的 models/SEEDVR2 路径。"}),
-    ("dit_model", "DiT 模型", "model", {"info": "从当前 SeedVR2 项目的 model_registry 自动读取可用模型；若暂时读取失败则使用常见候选项"}),
+    ("dit_model", "DiT 模型", "model", {"info": "从当前 SeedVR2 项目的 model_registry 自动读取可用模型；量化等级由模型文件决定。若填写 DiT 模型文件路径，则优先使用路径指定文件。"}),
+    ("dit_model_path", "DiT 模型文件路径", "textbox", {"info": "可选：直接输入 DiT 权重完整路径，或使用旁边的资源管理器按钮选择。填写后优先级高于上方 DiT 模型名。"}),
+    ("vae_model", "VAE 模型文件 / 名称", "textbox", {"info": "填写 VAE 模型文件名（由 model_dir 搜索）或本地模型文件完整路径；支持资源管理器选择。"}),
+    ("keep_models_resident", "跨任务常驻 DiT / VAE", "checkbox", {"info": "在同一 Gradio Python 进程中复用 DiT/VAE 模型缓存。为避免占满 8GB 显存，Offload Device=none 时会自动使用 CPU RAM；也可手动指定其他 Offload Device。"}),
     ("resolution", "目标短边分辨率", "dropdown_int", {"choices": [256, 384, 480, 512, 640, 720, 768, 896, 1024, 1080, 1280, 1440, 1536, 1920], "info": "输出视频的短边目标像素尺寸；可从常用值选择，也可输入自定义正整数。"}),
     ("max_resolution", "最大边长限制（0=不限）", "dropdown_int", {"choices": [0, 512, 720, 768, 1024, 1280, 1440, 1536, 1920, 2048, 2560, 2880, 3840], "info": "限制输出任意一边的最大像素；0 表示不限制。"}),
     ("batch_size", "Batch Size（需满足 4n+1）", "dropdown_int", {"choices": [1, 5, 9, 13, 17, 21, 25, 29, 33, 41, 49, 65, 81], "info": "帧批大小必须满足 4n+1。手动输入不符合规则时，界面会自动修正为最近的合法值并提示。"}),
@@ -110,7 +108,7 @@ FIELD_SPECS = [
     ("seed", "随机种子", "number_int", {"minimum": -2147483648, "maximum": 2147483647, "info": "随机种子；固定 Seed 有助于对比模型、量化等级和参数差异。"}),
     ("skip_first_frames", "跳过开头帧数", "dropdown_int", {"choices": [0, 1, 2, 5, 10, 15, 30, 60, 120], "info": "视频开始处跳过的帧数；图片输入不适用。可从常见值选取，也可输入自定义非负整数。"}),
     ("load_cap", "最多处理帧数（0=全部）", "dropdown_int", {"choices": [0, 25, 50, 100, 200, 300, 500, 1000], "info": "限制视频读取的最大帧数；0 表示处理全部可用帧。"}),
-    ("chunk_size", "流式分块帧数（0=不分块）", "dropdown_int", {"choices": [0, 25, 50, 100, 200, 330, 660, 1000], "info": "大于 0 时以指定帧数分块处理长视频，降低 RAM 峰值；0 表示不启用流式分块。"}),
+    ("chunk_size", "流式分块帧数（0=单个大 Chunk）", "dropdown_int", {"choices": [0, 25, 50, 100, 200, 330, 660, 1000], "info": "断点续处理以 Chunk 为最小提交单位。建议长视频设置 100–660；0 表示整个视频作为一个 Chunk，中断后只能重做这个视频。"}),
     ("prepend_frames", "前置反向帧数", "dropdown_int", {"choices": [0, 1, 2, 4, 8, 16], "info": "在输入开头添加反向帧以减轻起始处伪影；CLI 会在输出中移除这些前置帧。"}),
     ("temporal_overlap", "时序重叠帧数", "dropdown_int", {"choices": [0, 1, 2, 3, 4, 8, 12, 16], "info": "相邻流式 Chunk 或多 GPU 分段之间的重叠帧数；增加重叠可能改善连续性，但会增加计算量。"}),
     ("color_correction", "色彩校正", "dropdown", {"choices": ["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"], "info": "选择输出与输入之间的颜色匹配方法；lab 是建议的通用起点，none 关闭色彩校正。"}),
@@ -210,36 +208,26 @@ def atomic_write_json(path: Path, data: Any) -> None:
 
 
 def load_model_choices(cli_path: Path, force_refresh: bool = False) -> List[str]:
-    """Ask the actual SeedVR2 model registry for parser-compatible choices."""
+    """Read the registry in this process; never spawn a second inference interpreter."""
     try:
-        cache_key = str(cli_path.expanduser().resolve())
+        resolved_cli = cli_path.expanduser().resolve()
+        cache_key = str(resolved_cli)
     except Exception:
+        resolved_cli = cli_path
         cache_key = str(cli_path)
     with _MODEL_CHOICES_LOCK:
         if not force_refresh and cache_key in _MODEL_CHOICES_CACHE:
             return _MODEL_CHOICES_CACHE[cache_key][:]
     choices: List[str] = []
-    if cli_path.exists():
-        code = (
-            "import json; from src.utils.model_registry import get_available_dit_models; "
-            "print(json.dumps(get_available_dit_models()))"
-        )
+    if resolved_cli.exists():
         try:
-            cp = subprocess.run(
-                [sys.executable, "-c", code], cwd=str(cli_path.parent),
-                capture_output=True, text=True, timeout=45,
-                encoding="utf-8", errors="replace"
-            )
-            if cp.returncode == 0:
-                lines = [line.strip() for line in cp.stdout.splitlines() if line.strip()]
-                for line in reversed(lines):
-                    try:
-                        values = json.loads(line)
-                        if isinstance(values, list) and values:
-                            choices = [str(x) for x in values]
-                            break
-                    except Exception:
-                        continue
+            import sys
+            if str(resolved_cli.parent) not in sys.path:
+                sys.path.insert(0, str(resolved_cli.parent))
+            from src.utils.model_registry import get_available_dit_models
+            values = get_available_dit_models()
+            if isinstance(values, (list, tuple)):
+                choices = [str(x) for x in values if str(x).strip()]
         except Exception:
             pass
     if not choices:
@@ -334,553 +322,9 @@ def load_history_records() -> List[Dict[str, Any]]:
         return []
 
 
-class TaskManager:
-    """Single-worker task scheduler with idempotent control operations."""
-    TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
+from seedvr2_runtime import InProcessTaskManager, TaskAborted  # same-process inference engine
 
-    def __init__(self) -> None:
-        self.cv = threading.Condition(threading.RLock())
-        # Serializes OS suspend/resume operations so rapid button clicks cannot
-        # increment/decrement process suspend counts inconsistently.
-        self.control_lock = threading.RLock()
-        self.records: List[Dict[str, Any]] = load_history_records()
-        self.by_id: Dict[str, Dict[str, Any]] = {r["id"]: r for r in self.records}
-        self.pending: collections.deque[str] = collections.deque()
-        self.current_id: Optional[str] = None
-        self.proc: Optional[subprocess.Popen] = None
-        self.pause_requested = False
-        self.paused = False
-        self.stop_requested = False
-        self._last_submit_sig = ""
-        self._last_submit_time = 0.0
-        self._persist_locked()
-        self.worker = threading.Thread(target=self._worker_loop, name="SeedVR2-QueueWorker", daemon=True)
-        self.worker.start()
-
-    def _persist_locked(self) -> None:
-        try:
-            active_states = {"queued", "running", "paused", "pause_pending", "cancelling"}
-            active = [r for r in self.records if r.get("status") in active_states]
-            terminal = [r for r in self.records if r.get("status") not in active_states]
-            # Never evict queued/running jobs when a large batch exceeds MAX_HISTORY.
-            self.records = sorted(terminal[-MAX_HISTORY:] + active, key=lambda r: r.get("created_at", ""))
-            self.by_id = {r["id"]: r for r in self.records}
-            atomic_write_json(HISTORY_PATH, self.records)
-        except Exception as exc:
-            print(f"[History] Persist failed: {exc}", file=sys.stderr)
-
-    def _log_locked(self, rec: Dict[str, Any], text: str) -> None:
-        line = ANSI_RE.sub("", str(text)).rstrip()
-        if not line:
-            return
-        rec.setdefault("logs", []).append({"time": now_iso(), "text": line})
-        rec["logs"] = rec["logs"][-MAX_JOB_LOG_LINES:]
-        # Persist each emitted line to keep logs recoverable after an app crash.
-        self._persist_locked()
-
-    def log(self, job_id: str, text: str) -> None:
-        with self.cv:
-            rec = self.by_id.get(job_id)
-            if rec:
-                self._log_locked(rec, text)
-
-    def submit(self, paths: List[str], params: Dict[str, Any], cli_path: str, output_root: str) -> Tuple[int, str]:
-        signature = hashlib.sha256(json.dumps({"paths": paths, "params": params, "cli": cli_path, "out": output_root}, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
-        now = time.monotonic()
-        with self.cv:
-            if signature == self._last_submit_sig and now - self._last_submit_time < 2.0:
-                return 0, "检测到短时间内重复点击，已忽略重复提交。"
-            self._last_submit_sig = signature
-            self._last_submit_time = now
-            added = 0
-            for raw_path in paths:
-                path = str(Path(raw_path).expanduser().resolve())
-                job_id = uuid.uuid4().hex[:12]
-                rec = {
-                    "id": job_id,
-                    "name": Path(path).name or path,
-                    "input": path,
-                    "cli_path": str(Path(cli_path).expanduser().resolve()),
-                    "output_root": str(Path(output_root).expanduser().resolve()),
-                    "output_path": "",
-                    "status": "queued",
-                    "progress": 0,
-                    "created_at": now_iso(),
-                    "started_at": None,
-                    "finished_at": None,
-                    "elapsed_seconds": 0.0,
-                    "return_code": None,
-                    "error": "",
-                    "params": dict(params),
-                    "logs": [],
-                    "command": [],
-                }
-                self.records.append(rec)
-                self.by_id[job_id] = rec
-                self.pending.append(job_id)
-                self._log_locked(rec, f"任务已加入队列：{path}")
-                added += 1
-            self._persist_locked()
-            self.cv.notify_all()
-        return added, f"已提交 {added} 个任务，队列将按顺序执行。"
-
-    def pause(self) -> str:
-        with self.cv:
-            if self.stop_requested:
-                return "队列正在终止，暂时不能暂停。"
-            if self.paused or self.pause_requested:
-                return "任务已经暂停或正在进入暂停状态；重复点击已忽略。"
-            if not self.current_id and not self.pending:
-                return "当前没有可暂停的任务。"
-            self.pause_requested = True
-            proc = self.proc
-            current = self.by_id.get(self.current_id) if self.current_id else None
-            if current:
-                current["status"] = "pause_pending"
-                self._log_locked(current, "收到暂停请求。")
-            self.cv.notify_all()
-        if proc and proc.poll() is None:
-            return self._apply_pause_to_process(proc, self.current_id)
-        return "已登记暂停请求；若任务正在启动，将在进程可控时暂停；若已到任务间隙，将暂停后续任务。"
-
-    def _apply_pause_to_process(self, proc: subprocess.Popen, job_id: Optional[str]) -> str:
-        with self.control_lock:
-            with self.cv:
-                if self.stop_requested or not self.pause_requested:
-                    return "暂停请求已被取消。"
-                if self.paused:
-                    return "当前进程已经暂停。"
-                if self.proc is not proc or proc.poll() is not None:
-                    return "推理进程已结束或尚未就绪；暂停请求将在任务边界生效。"
-            ok, message = self._suspend_process_tree(proc)
-            with self.cv:
-                rec = self.by_id.get(job_id) if job_id else None
-                if ok and self.proc is proc and proc.poll() is None and not self.stop_requested:
-                    self.paused = True
-                    if rec:
-                        rec["status"] = "paused"
-                    if rec:
-                        self._log_locked(rec, "进程树已挂起；点击恢复继续。")
-                    self.cv.notify_all()
-                    return "已暂停当前推理进程。"
-                if rec:
-                    self._log_locked(rec, message)
-                return message
-
-    def _apply_pending_pause(self, job_id: str, proc: subprocess.Popen) -> None:
-        with self.cv:
-            should_pause = self.pause_requested and not self.paused and not self.stop_requested
-        if should_pause:
-            self._apply_pause_to_process(proc, job_id)
-
-    def resume(self) -> str:
-        with self.control_lock:
-            with self.cv:
-                if not self.pause_requested and not self.paused:
-                    return "当前任务并未处于暂停状态；重复点击已忽略。"
-                if self.stop_requested:
-                    return "队列正在终止，不能恢复。"
-                proc = self.proc
-                was_paused = self.paused
-            if was_paused and proc and proc.poll() is None:
-                ok, message = self._resume_process_tree(proc)
-                if not ok:
-                    return message
-            with self.cv:
-                self.pause_requested = False
-                self.paused = False
-                rec = self.by_id.get(self.current_id) if self.current_id else None
-                if rec and rec.get("status") in {"paused", "pause_pending"}:
-                    rec["status"] = "running"
-                    self._log_locked(rec, "收到恢复请求，任务继续执行。")
-                self.cv.notify_all()
-        return "已恢复队列/当前推理。"
-
-    def stop_all(self) -> str:
-        with self.cv:
-            if self.stop_requested:
-                return "终止请求已经提交，正在结束进程；重复点击已忽略。"
-            if not self.current_id and not self.pending:
-                return "当前没有运行中或等待中的任务。"
-            self.stop_requested = True
-            self.pause_requested = False
-            self.paused = False
-            proc = self.proc
-            # Pending jobs are cancelled atomically; active job is killed below.
-            while self.pending:
-                jid = self.pending.popleft()
-                rec = self.by_id.get(jid)
-                if rec and rec.get("status") == "queued":
-                    rec["status"] = "cancelled"
-                    rec["finished_at"] = now_iso()
-                    rec["error"] = "用户终止队列时取消了等待任务。"
-                    self._log_locked(rec, rec["error"])
-            rec = self.by_id.get(self.current_id) if self.current_id else None
-            if rec:
-                rec["status"] = "cancelling"
-                self._log_locked(rec, "收到终止请求，正在结束 CLI 与子进程……")
-            self.cv.notify_all()
-        if proc and proc.poll() is None:
-            self._terminate_process_tree(proc)
-        return "已发出终止请求；当前任务及等待任务将被取消。"
-
-    @staticmethod
-    def _suspend_process_tree(proc: subprocess.Popen) -> Tuple[bool, str]:
-        if psutil is None:
-            return False, "当前环境未安装 psutil，无法安全挂起 Windows/CUDA 进程树。请安装：pip install psutil。暂停请求保留，将在任务边界等待。"
-        suspended = []
-        try:
-            root = psutil.Process(proc.pid)
-            children = root.children(recursive=True)
-            # Suspend descendants first so no worker continues while the parent is stopped.
-            for child in reversed(children):
-                try:
-                    child.suspend()
-                    suspended.append(child)
-                except psutil.NoSuchProcess:
-                    pass
-            root.suspend()
-            suspended.append(root)
-            return True, "进程树已挂起。"
-        except psutil.NoSuchProcess:
-            return False, "推理进程已结束，无法暂停。"
-        except Exception as exc:
-            # Roll back any partial suspension; never leave only CUDA workers frozen.
-            for process in reversed(suspended):
-                try: process.resume()
-                except Exception: pass
-            return False, f"进程暂停失败（已尝试回滚部分挂起的子进程）：{type(exc).__name__}: {exc}"
-
-    @staticmethod
-    def _resume_process_tree(proc: subprocess.Popen) -> Tuple[bool, str]:
-        if psutil is None:
-            return False, "当前环境未安装 psutil，无法恢复挂起的进程树。"
-        try:
-            root = psutil.Process(proc.pid)
-            children = root.children(recursive=True)
-            failures = []
-            # Resume the parent first, then its workers.
-            for process in [root] + children:
-                try: process.resume()
-                except psutil.NoSuchProcess: pass
-                except Exception as exc: failures.append(str(exc))
-            if failures:
-                return False, "部分进程恢复失败：" + "; ".join(failures[:3])
-            return True, "进程树已恢复。"
-        except psutil.NoSuchProcess:
-            return False, "推理进程已结束，无需恢复。"
-        except Exception as exc:
-            return False, f"恢复进程失败：{type(exc).__name__}: {exc}"
-
-    @staticmethod
-    def _terminate_process_tree(proc: subprocess.Popen) -> None:
-        if proc.poll() is not None:
-            return
-        if psutil is not None:
-            try:
-                root = psutil.Process(proc.pid)
-                children = root.children(recursive=True)
-                for child in reversed(children):
-                    try: child.terminate()
-                    except psutil.NoSuchProcess: pass
-                try: root.terminate()
-                except psutil.NoSuchProcess: pass
-                gone, alive = psutil.wait_procs([root] + children, timeout=3)
-                for p in alive:
-                    try: p.kill()
-                    except psutil.NoSuchProcess: pass
-                psutil.wait_procs(alive, timeout=3)
-            except Exception:
-                pass
-        if proc.poll() is None:
-            try:
-                if os.name == "nt":
-                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=8)
-                else:
-                    os.killpg(proc.pid, signal.SIGKILL)
-            except Exception:
-                try: proc.kill()
-                except Exception: pass
-        try: proc.wait(timeout=5)
-        except Exception: pass
-
-    def _wait_if_paused(self, job_id: Optional[str] = None) -> bool:
-        with self.cv:
-            while self.pause_requested and not self.stop_requested:
-                if job_id and job_id in self.by_id:
-                    rec = self.by_id[job_id]
-                    if rec.get("status") not in {"paused", "pause_pending"}:
-                        rec["status"] = "paused"
-                        self._log_locked(rec, "队列已在任务边界暂停，等待恢复。")
-                self.cv.wait(timeout=0.5)
-            return not self.stop_requested
-
-    def _worker_loop(self) -> None:
-        while True:
-            with self.cv:
-                while not self.pending or self.pause_requested:
-                    self.cv.wait(timeout=0.5)
-                if not self.pending:
-                    continue
-                job_id = self.pending.popleft()
-                self.current_id = job_id
-                self.stop_requested = False
-                self.paused = False
-                rec = self.by_id.get(job_id)
-                if not rec:
-                    self.current_id = None
-                    continue
-                rec["status"] = "running"
-                rec["started_at"] = now_iso()
-                self._log_locked(rec, "任务开始准备。")
-            self._run_one(job_id)
-            with self.cv:
-                self.proc = None
-                self.current_id = None
-                self.stop_requested = False
-                # A pause requested during the last item keeps the rest of queue paused.
-                self.cv.notify_all()
-
-    def _run_one(self, job_id: str) -> None:
-        with self.cv:
-            rec = self.by_id[job_id]
-            params = dict(rec["params"])
-            input_path = rec["input"]
-            cli_path = rec["cli_path"]
-            output_root = rec["output_root"]
-        started = time.monotonic()
-        try:
-            if not self._wait_if_paused(job_id):
-                raise InterruptedError("任务在启动前被终止。")
-            cli = Path(cli_path).expanduser().resolve()
-            inp = Path(input_path).expanduser().resolve()
-            if not cli.is_file():
-                raise FileNotFoundError(f"找不到 inference_cli.py：{cli}")
-            if not inp.exists():
-                raise FileNotFoundError(f"输入不存在：{inp}")
-            if not inp.is_dir() and inp.suffix.lower() not in {
-                ".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v",
-                ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"
-            }:
-                raise ValueError(f"不支持的输入格式：{inp.suffix}")
-            if inp.is_dir():
-                valid_ext = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v", ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
-                if not any(p.is_file() and p.suffix.lower() in valid_ext for p in inp.iterdir()):
-                    raise ValueError(f"目录中没有受支持的媒体文件：{inp}")
-            out_base = Path(output_root).expanduser().resolve()
-            out_base.mkdir(parents=True, exist_ok=True)
-            # Each submitted source gets its own output subfolder to avoid basename collisions.
-            out_dir = out_base / f"{inp.stem or inp.name}_{job_id}"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            command = self._build_command(cli, inp, out_dir, params)
-            with self.cv:
-                rec = self.by_id[job_id]
-                rec["output_path"] = str(out_dir)
-                rec["command"] = command[:]
-                self._log_locked(rec, "执行命令：" + shlex.join(command))
-                if self.stop_requested:
-                    raise InterruptedError("任务在启动前被终止。")
-            env = os.environ.copy()
-            env["PYTHONPATH"] = str(cli.parent) + os.pathsep + env.get("PYTHONPATH", "")
-            kwargs: Dict[str, Any] = {
-                "cwd": str(cli.parent), "stdin": subprocess.DEVNULL,
-                "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT,
-                "text": True, "encoding": "utf-8", "errors": "replace",
-                "bufsize": 1, "env": env,
-            }
-            if os.name == "nt":
-                kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            else:
-                kwargs["start_new_session"] = True
-            proc = subprocess.Popen(command, **kwargs)
-            with self.cv:
-                self.proc = proc
-                cancel_now = self.stop_requested
-                pause_now = self.pause_requested
-            if cancel_now:
-                self._terminate_process_tree(proc)
-            elif pause_now:
-                self._apply_pending_pause(job_id, proc)
-            self._stream_process(job_id, proc)
-            rc = proc.poll()
-            elapsed = time.monotonic() - started
-            with self.cv:
-                rec = self.by_id[job_id]
-                rec["elapsed_seconds"] = round(elapsed, 3)
-                rec["return_code"] = rc
-                rec["finished_at"] = now_iso()
-                if self.stop_requested or rec.get("status") == "cancelling":
-                    rec["status"] = "cancelled"
-                    rec["error"] = "任务已由用户终止。"
-                    self._log_locked(rec, "任务已终止。")
-                elif rc == 0:
-                    rec["status"] = "succeeded"
-                    rec["progress"] = 100
-                    self._log_locked(rec, f"任务成功完成，耗时 {pretty_time(elapsed)}。")
-                else:
-                    rec["status"] = "failed"
-                    rec["error"] = f"inference_cli.py 返回非零退出码：{rc}"
-                    self._log_locked(rec, rec["error"])
-        except InterruptedError as exc:
-            with self.cv:
-                rec = self.by_id[job_id]
-                rec["status"] = "cancelled"
-                rec["error"] = str(exc)
-                rec["finished_at"] = now_iso()
-                self._log_locked(rec, str(exc))
-        except Exception as exc:
-            with self.cv:
-                rec = self.by_id[job_id]
-                rec["status"] = "failed"
-                rec["error"] = f"{type(exc).__name__}: {exc}"
-                rec["finished_at"] = now_iso()
-                self._log_locked(rec, rec["error"])
-                self._log_locked(rec, traceback.format_exc())
-        finally:
-            with self.cv:
-                rec = self.by_id.get(job_id)
-                if rec and not rec.get("finished_at"):
-                    rec["finished_at"] = now_iso()
-                    rec["elapsed_seconds"] = round(time.monotonic() - started, 3)
-                self.proc = None
-                self.cv.notify_all()
-
-    @staticmethod
-    def _build_command(cli: Path, inp: Path, out_dir: Path, p: Dict[str, Any]) -> List[str]:
-        cmd = [sys.executable, str(cli), str(inp), "--output", str(out_dir)]
-        scalar_map = {
-            "video_backend": "--video_backend", "model_dir": "--model_dir", "dit_model": "--dit_model",
-            "resolution": "--resolution", "max_resolution": "--max_resolution", "batch_size": "--batch_size",
-            "seed": "--seed", "skip_first_frames": "--skip_first_frames", "load_cap": "--load_cap",
-            "chunk_size": "--chunk_size", "prepend_frames": "--prepend_frames", "temporal_overlap": "--temporal_overlap",
-            "color_correction": "--color_correction", "input_noise_scale": "--input_noise_scale",
-            "latent_noise_scale": "--latent_noise_scale", "cuda_device": "--cuda_device",
-            "dit_offload_device": "--dit_offload_device", "vae_offload_device": "--vae_offload_device",
-            "tensor_offload_device": "--tensor_offload_device", "blocks_to_swap": "--blocks_to_swap",
-            "vae_encode_tile_size": "--vae_encode_tile_size", "vae_encode_tile_overlap": "--vae_encode_tile_overlap",
-            "vae_decode_tile_size": "--vae_decode_tile_size", "vae_decode_tile_overlap": "--vae_decode_tile_overlap",
-            "tile_debug": "--tile_debug", "attention_mode": "--attention_mode", "compile_backend": "--compile_backend",
-            "compile_mode": "--compile_mode", "compile_dynamo_cache_size_limit": "--compile_dynamo_cache_size_limit",
-            "compile_dynamo_recompile_limit": "--compile_dynamo_recompile_limit",
-        }
-        int_keys = {
-            "resolution", "max_resolution", "batch_size", "seed", "skip_first_frames", "load_cap",
-            "chunk_size", "prepend_frames", "temporal_overlap", "blocks_to_swap",
-            "vae_encode_tile_size", "vae_encode_tile_overlap", "vae_decode_tile_size",
-            "vae_decode_tile_overlap", "compile_dynamo_cache_size_limit", "compile_dynamo_recompile_limit",
-        }
-        float_keys = {"input_noise_scale", "latent_noise_scale"}
-        for key, flag in scalar_map.items():
-            value = p.get(key)
-            if value is None or value == "":
-                continue
-            if key in int_keys:
-                value = int(float(value))
-            elif key in float_keys:
-                value = float(value)
-            cmd.extend([flag, str(value)])
-        output_format = p.get("output_format", "auto")
-        if output_format in {"mp4", "png"}:
-            cmd.extend(["--output_format", output_format])
-        bool_map = {
-            "use_10bit": "--10bit", "uniform_batch_size": "--uniform_batch_size",
-            "swap_io_components": "--swap_io_components", "vae_encode_tiled": "--vae_encode_tiled",
-            "vae_decode_tiled": "--vae_decode_tiled", "compile_dit": "--compile_dit",
-            "compile_vae": "--compile_vae", "compile_fullgraph": "--compile_fullgraph",
-            "compile_dynamic": "--compile_dynamic", "cache_dit": "--cache_dit",
-            "cache_vae": "--cache_vae", "debug": "--debug",
-        }
-        for key, flag in bool_map.items():
-            if bool(p.get(key, False)):
-                cmd.append(flag)
-        return cmd
-
-    def _stream_process(self, job_id: str, proc: subprocess.Popen) -> None:
-        lines: queue.Queue = queue.Queue()
-        def reader() -> None:
-            try:
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    lines.put(line.rstrip("\r\n"))
-            except Exception as exc:
-                lines.put(f"[GUI log reader] {type(exc).__name__}: {exc}")
-            finally:
-                lines.put(None)
-        reader_thread = threading.Thread(target=reader, name=f"SeedVR2-LogReader-{job_id}", daemon=True)
-        reader_thread.start()
-        eof = False
-        while True:
-            with self.cv:
-                stop = self.stop_requested
-            if stop and proc.poll() is None:
-                self._terminate_process_tree(proc)
-            try:
-                line = lines.get(timeout=0.25)
-                if line is None:
-                    eof = True
-                else:
-                    self._record_cli_line(job_id, line)
-            except queue.Empty:
-                pass
-            if proc.poll() is not None and eof and lines.empty():
-                break
-        reader_thread.join(timeout=2)
-        try:
-            if proc.stdout:
-                proc.stdout.close()
-        except Exception:
-            pass
-
-    def _record_cli_line(self, job_id: str, line: str) -> None:
-        with self.cv:
-            rec = self.by_id.get(job_id)
-            if not rec:
-                return
-            self._log_locked(rec, line)
-            m = re.search(r"Chunk\s+(\d+)\s*/\s*(\d+)", line, re.I)
-            if m and int(m.group(2)) > 0:
-                rec["progress"] = max(int(rec.get("progress", 0)), min(95, int(5 + 90 * int(m.group(1)) / int(m.group(2)))))
-            m = re.search(r"Processing file\s+(\d+)\s*/\s*(\d+)", line, re.I)
-            if m and int(m.group(2)) > 0:
-                rec["progress"] = max(int(rec.get("progress", 0)), min(95, int(5 + 90 * int(m.group(1)) / int(m.group(2)))))
-
-    def snapshot(self) -> Dict[str, Any]:
-        with self.cv:
-            records = list(self.records)
-            current = self.by_id.get(self.current_id) if self.current_id else None
-            pending = len(self.pending)
-            paused = self.pause_requested or self.paused
-            return {"records": records, "current": dict(current) if current else None, "pending": pending, "paused": paused,
-                    "active": self.current_id is not None, "can_stop": self.current_id is not None or pending > 0}
-
-    def get_record(self, record_id: str) -> Optional[Dict[str, Any]]:
-        with self.cv:
-            r = self.by_id.get(record_id)
-            return dict(r) if r else None
-
-    def delete_record(self, record_id: str) -> Tuple[bool, str]:
-        with self.cv:
-            rec = self.by_id.get(record_id)
-            if not rec:
-                return False, "找不到所选历史记录。"
-            if rec.get("status") in {"queued", "running", "paused", "pause_pending", "cancelling"}:
-                return False, "不能删除正在运行或等待中的任务记录。请先终止任务。"
-            self.records = [r for r in self.records if r.get("id") != record_id]
-            self.by_id.pop(record_id, None)
-            self._persist_locked()
-            return True, "已删除所选历史记录。"
-
-    def clear_history(self) -> Tuple[bool, str]:
-        with self.cv:
-            if self.current_id or self.pending:
-                return False, "队列仍有运行中或等待中的任务。请先终止队列，再清空历史。"
-            self.records.clear()
-            self.by_id.clear()
-            self._persist_locked()
-            return True, "历史记录已全部清空。"
-
-
-MANAGER = TaskManager()
+MANAGER = InProcessTaskManager()
 
 
 def get_model_choices(cli_path_value: str) -> List[str]:
@@ -964,6 +408,51 @@ def _browse_directory(current: str, kind: str) -> Tuple[Any, str]:
     return chosen, note
 
 
+def _browse_model_file(current: str, model_kind: str) -> Tuple[str, str]:
+    title = "选择 DiT 主干模型文件" if model_kind == "dit" else "选择 VAE 模型文件"
+    root = None
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+        current_path = Path(current).expanduser() if current else None
+        initial_dir = str(current_path.parent if current_path and current_path.is_file() else current_path) if current_path else None
+        if initial_dir and not Path(initial_dir).exists():
+            initial_dir = None
+        chosen = filedialog.askopenfilename(
+            parent=root, title=title, initialdir=initial_dir,
+            filetypes=[("Model weights", "*.safetensors *.gguf *.pt *.pth *.bin *.ckpt"), ("All files", "*.*")],
+        )
+        if not chosen:
+            return current or "", "已取消模型文件选择，原设置保持不变。"
+        return str(Path(chosen).resolve()), f"已选择 {model_kind.upper()} 模型：`{chosen}`"
+    except Exception as exc:
+        return current or "", f"无法打开原生文件选择器：{type(exc).__name__}: {exc}"
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+
+def _browse_dit_model_file(current: str) -> Tuple[str, str]:
+    value, note = _browse_model_file(current, "dit")
+    save_config_values({"dit_model_path": value})
+    return value, note
+
+
+def _browse_vae_model_file(current: str) -> Tuple[str, str]:
+    value, note = _browse_model_file(current, "vae")
+    save_config_values({"vae_model": value})
+    return value, note
+
+
 def _browse_input_files(current_text: str) -> Tuple[str, str]:
     chosen, note = _native_dialog("media_files", "", "选择一个或多个媒体文件")
     if not chosen:
@@ -990,29 +479,19 @@ def _browse_input_folder(current_text: str) -> Tuple[str, str]:
 
 
 def detect_local_devices() -> Dict[str, Any]:
-    """Query the same Python environment used to launch this GUI for device types."""
+    """Query the active interpreter directly so the GUI uses its current torch build."""
     result: Dict[str, Any] = {"backend": "cpu", "cuda": [], "mps": False, "note": "未检测到 CUDA GPU；仍可手动编辑设备值。"}
-    code = (
-        "import json; import torch; "
-        "d={'cuda': [], 'mps': bool(getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available())}; "
-        "d['cuda']=[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else []; "
-        "print(json.dumps(d, ensure_ascii=False))"
-    )
     try:
-        cp = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=25, encoding="utf-8", errors="replace")
-        if cp.returncode == 0:
-            for line in reversed(cp.stdout.splitlines()):
-                try:
-                    data = json.loads(line.strip())
-                    cuda = data.get("cuda") or []
-                    mps = bool(data.get("mps"))
-                    result.update({"cuda": cuda, "mps": mps, "backend": "cuda" if cuda else ("mps" if mps else "cpu")})
-                    result["note"] = f"检测到 {len(cuda)} 张 CUDA GPU。" if cuda else ("检测到 Apple MPS 设备。" if mps else "PyTorch 未检测到 CUDA/MPS 设备。")
-                    return result
-                except Exception:
-                    continue
+        import torch
+        cuda = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else []
+        mps_backend = getattr(torch.backends, "mps", None)
+        mps = bool(mps_backend and mps_backend.is_available())
+        result.update({"cuda": cuda, "mps": mps, "backend": "cuda" if cuda else ("mps" if mps else "cpu")})
+        result["note"] = f"检测到 {len(cuda)} 张 CUDA GPU。" if cuda else ("检测到 Apple MPS 设备。" if mps else "PyTorch 未检测到 CUDA/MPS 设备。")
+        if cuda or mps:
+            return result
     except Exception as exc:
-        result["note"] = f"PyTorch 设备查询失败：{type(exc).__name__}: {exc}。尝试使用 nvidia-smi。"
+        result["note"] = f"当前 Python 的 PyTorch 设备查询失败：{type(exc).__name__}: {exc}。尝试使用 nvidia-smi。"
     try:
         cp = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True, timeout=8, encoding="utf-8", errors="replace")
         if cp.returncode == 0:
@@ -1068,7 +547,26 @@ def _normalise_batch_size(value: Any) -> Tuple[Any, str]:
 
 
 def _model_block_limit(model_name: str) -> int:
+    """Conservative block-swap limit inferred from registry label or selected filename."""
     return 36 if "7b" in str(model_name).lower() else 32
+
+
+def _on_dit_path_change(model_path: str, current_blocks: Any) -> Tuple[Any, str]:
+    selected = str(model_path or "").strip()
+    if not selected:
+        return _on_model_change(DEFAULTS["dit_model"], current_blocks)
+    limit = _model_block_limit(Path(selected).name)
+    try:
+        value = _strict_int(current_blocks or 0, "blocks_to_swap")
+    except (TypeError, ValueError, OverflowError):
+        value = 0
+    fixed = min(max(0, value), limit)
+    save_config_values({"dit_model_path": selected, "blocks_to_swap": fixed})
+    choices = [0, 4, 8, 12, 16, 20, 24, 28, 32] + ([36] if limit == 36 else [])
+    note = f"根據自選 DiT 檔名推斷 BlockSwap 上限為 {limit}。"
+    if fixed != value:
+        note += f" 已將目前值從 {value} 修正為 {fixed}。"
+    return gr.update(value=fixed, choices=choices), note
 
 
 def _on_model_change(model_name: str, current_blocks: Any) -> Tuple[Any, str]:
@@ -1243,6 +741,17 @@ def validate_settings(p: Dict[str, Any], cli_path: str, output_root: str, inputs
         if out_path.exists() and not out_path.is_dir():
             errors.append(f"输出根目录不是文件夹：{out_path}")
 
+    dit_path = str(p.get("dit_model_path", "") or "").strip()
+    if dit_path:
+        model_file = Path(dit_path).expanduser()
+        if not model_file.is_file():
+            errors.append(f"DiT 模型文件不存在：{model_file}")
+    vae_value = str(p.get("vae_model", "") or "").strip()
+    if vae_value:
+        vae_candidate = Path(vae_value).expanduser()
+        if (vae_candidate.is_absolute() or vae_candidate.parent != Path(".")) and not vae_candidate.is_file():
+            errors.append(f"VAE 模型文件不存在：{vae_candidate}")
+
     model_dir = str(p.get("model_dir", "") or "").strip()
     if model_dir:
         model_path = Path(model_dir).expanduser()
@@ -1294,9 +803,9 @@ def validate_settings(p: Dict[str, Any], cli_path: str, output_root: str, inputs
     model_choice = str(p.get("dit_model", ""))
     if cli.is_file():
         supported_models = load_model_choices(cli)
-        if supported_models and model_choice not in supported_models:
-            errors.append(f"当前 CLI 的 Model Registry 不包含模型：{model_choice}。请刷新模型列表并选择有效模型。")
-    model_name = model_choice.lower()
+        if supported_models and model_choice not in supported_models and not str(p.get("dit_model_path", "") or "").strip():
+            errors.append(f"当前 CLI 的 Model Registry 不包含模型：{model_choice}。请刷新模型列表、选择有效模型，或指定 DiT 模型文件路径。")
+    model_name = str(p.get("dit_model_path") or model_choice).lower()
     model_block_limit = 36 if "7b" in model_name else 32
     if parsed.get("blocks_to_swap", 0) > model_block_limit:
         errors.append(f"当前模型 BlockSwap 上限为 {model_block_limit}。")
@@ -1424,9 +933,9 @@ def _load_config_outputs(components: List[Any]) -> Tuple[Any, ...]:
     cfg, note = safe_config_load()
     saved_cli = cfg.get("cli_path", str(DEFAULT_CLI))
     available_models = load_model_choices(Path(saved_cli).expanduser().resolve())
-    if cfg.get("dit_model") not in available_models:
+    if cfg.get("dit_model") not in available_models and not cfg.get("dit_model_path"):
         cfg["dit_model"] = available_models[0] if available_models else DEFAULTS["dit_model"]
-        note += "（已将当前不可用的模型选项替换为可用候选项。）"
+        note += "（已将当前不可用的 DiT 模型名替换为可用候选项；指定模型文件路径时不覆盖路径设置。）"
     values = [saved_cli, cfg.get("input_paths", ""), cfg.get("output_root", str(APP_DIR / "outputs"))]
     values.extend(cfg.get(k, DEFAULTS[k]) for k in PARAM_KEYS)
     return tuple(values + [note])
@@ -1460,7 +969,15 @@ def _stop() -> str:
     return MANAGER.stop_all()
 
 
-def _refresh() -> Tuple[str, str, str, List[List[Any]], Any, Any, Any]:
+def _safe_stop() -> str:
+    return MANAGER.safe_stop()
+
+
+def _clear_model_cache() -> str:
+    return MANAGER.clear_model_cache()
+
+
+def _refresh() -> Tuple[str, str, str, List[List[Any]], Any, Any, Any, Any]:
     snap = MANAGER.snapshot()
     current = snap["current"]
     queued = snap["pending"]
@@ -1468,20 +985,27 @@ def _refresh() -> Tuple[str, str, str, List[List[Any]], Any, Any, Any]:
         status = current.get("status", "running").upper()
         title = html.escape(current.get("name", "active task"))
         pct = max(0, min(100, int(current.get("progress", 0))))
-        label = f"{status} · {title} · {pct}% · 等待队列 {queued}"
-        bar = f'<div class="progress-wrap"><div class="progress-head"><span>{status} · {title}</span><b>{pct}%</b></div><div class="progress-bg"><div class="progress-fill" style="width:{pct}%"></div></div><small>当前文件级进度仅在 CLI 输出 Chunk / Processing file 时可计算；其余阶段以实时日志为准。等待队列：{queued}</small></div>'
+        chunk_text = ""
+        if current.get("chunk_total"):
+            chunk_text = f" · Chunk {current.get('chunk_completed', 0)}/{current.get('chunk_total')}"
+        label = f"{status} · {title} · {pct}%{chunk_text} · 等待队列 {queued}"
+        bar = f'<div class="progress-wrap"><div class="progress-head"><span>{status} · {title}{chunk_text}</span><b>{pct}%</b></div><div class="progress-bg"><div class="progress-fill" style="width:{pct}%"></div></div><small>进度按已提交 Chunk / 文件更新；当前模型 Batch 推理过程以实时日志为准。等待队列：{queued}</small></div>'
         logs = current.get("logs", [])[-180:]
     else:
         status = "PAUSED" if snap["paused"] else ("QUEUE IDLE" if queued == 0 else "QUEUED")
         label = f"{status} · 等待任务 {queued}"
-        bar = f'<div class="progress-wrap"><div class="progress-head"><span>{status}</span><b>{queued} pending</b></div><div class="progress-bg"><div class="progress-fill" style="width:0%"></div></div><small>提交后任务将由单一工作线程串行处理，避免多个 SeedVR2 实例争抢显存。</small></div>'
+        bar = f'<div class="progress-wrap"><div class="progress-head"><span>{status}</span><b>{queued} pending</b></div><div class="progress-bg"><div class="progress-fill" style="width:0%"></div></div><small>同一个 Python 进程内串行调用 SeedVR2 核心；启用常驻模型缓存时，相同模型配置可跨任务复用。</small></div>'
         latest = sorted(snap["records"], key=lambda r: r.get("created_at", ""))[-1:] 
         logs = latest[0].get("logs", [])[-180:] if latest else []
     log_text = "\n".join(f"[{x.get('time','')[-8:]}] {x.get('text','')}" for x in logs)
     rows = []
     for r in sorted(snap["records"], key=lambda x: x.get("created_at", ""), reverse=True)[:80]:
         rows.append([r.get("id", "")[:8], r.get("status", ""), r.get("name", ""), f"{r.get('progress', 0)}%", pretty_time(r.get("elapsed_seconds", 0)), r.get("output_path", "")])
-    return label, bar, log_text, rows, gr.update(interactive=bool(current or queued)), gr.update(interactive=bool(current and not snap["paused"])), gr.update(interactive=bool(snap["paused"]))
+    active = bool(current or queued)
+    return (label, bar, log_text, rows,
+            gr.update(interactive=active), gr.update(interactive=active),
+            gr.update(interactive=bool(current and not snap["paused"])),
+            gr.update(interactive=bool(snap["paused"])))
 
 
 def _preview(input_paths_text: str, cli_path: str, output_root: str, *ui_params: Any) -> str:
@@ -1489,13 +1013,26 @@ def _preview(input_paths_text: str, cli_path: str, output_root: str, *ui_params:
     if not paths:
         return "请先填写输入路径。"
     p = config_from_ui(list(ui_params))
-    inp = Path(paths[0]).expanduser()
-    out = Path(output_root).expanduser() / f"{inp.stem or inp.name}_preview"
-    try:
-        cmd = TaskManager._build_command(Path(cli_path).expanduser().resolve(), inp.resolve(), out.resolve(), p)
-        return "```powershell\n" + shlex.join(cmd) + "\n```"
-    except Exception as exc:
-        return f"命令预览失败：{type(exc).__name__}: {exc}"
+    keep = bool(p.get("keep_models_resident", True))
+    chunk = int(float(p.get("chunk_size", 0) or 0))
+    devices = [x.strip() for x in str(p.get("cuda_device", "") or "0").split(",") if x.strip()]
+    single_gpu = len(devices) <= 1
+    plan = (
+        "### 同进程执行方案\n"
+        f"- 推理核心：`{Path(cli_path).resolve()}`（由当前 Gradio 进程直接 import，不启动 CLI 子进程）\n"
+        f"- 输入任务：{len(paths)} 项；按队列顺序串行执行\n"
+        f"- Chunk Size：`{chunk}`（0 表示整个视频作为一个 Chunk）\n"
+        f"- Chunk 检查点：每个 Chunk 独立写入并关闭，原子更新 `checkpoint.json`\n"
+        f"- 完成处理：所有 Chunk 完成后合并为最终视频\n"
+        f"- 模型驻留：{'启用' if keep else '关闭'}；模型/设备/编译等配置变化时重建运行上下文\n"
+        f"- GPU 路径：{'单 GPU；支持 Chunk 断点、常驻缓存和协作控制' if single_gpu else '多 GPU；回退到上游 multiprocessing 路径'}\n"
+        f"- DiT：`{p.get('dit_model_path') or p.get('dit_model')}`\n"
+        f"- VAE：`{p.get('vae_model') or '使用 SeedVR2 默认 VAE'}`\n"
+        "- 恢复方式：重新提交相同输入与参数，程序从最后一个有效检查点继续。"
+    )
+    if not single_gpu:
+        plan += "\n\n**多 GPU 限制**：此兼容路径不提供 Chunk 级断点、跨任务模型常驻，也不能在 worker 推理期间响应暂停/安全停止/立即停止；这些控制要等上游多进程任务自行结束后才能恢复。长视频如需可恢复和协作控制，请选择单 GPU。"
+    return plan
 
 
 def _restore_history(record_id: str) -> Tuple[Any, ...]:
@@ -1594,14 +1131,14 @@ def build_app() -> gr.Blocks:
     else:
         blocks_kwargs["fill_width"] = True
     with gr.Blocks(**blocks_kwargs) as demo:
-        gr.HTML("""<div class="seed-hero"><h1>SeedVR2 · Video Restoration Workbench</h1><p>面向本地推理的统一控制台：精确映射 inference_cli.py 参数，支持原生文件/目录选择、量化模型、显存优化、批量队列、任务控制、历史恢复和参数持久化。</p><span class="seed-chip">CLI 参数完整映射</span><span class="seed-chip">Native File Picker</span><span class="seed-chip">CPU Offload / BlockSwap</span><span class="seed-chip">Linked Validation</span><span class="seed-chip">Auto Save</span></div>""")
+        gr.HTML("""<div class="seed-hero"><h1>SeedVR2 · Video Restoration Workbench</h1><p>面向本地推理的统一控制台：同进程 SeedVR2 推理、DiT/VAE 常驻缓存、Chunk 独立落盘与断点恢复、批量队列、模型文件选择和完整参数控制。</p><span class="seed-chip">In-Process Engine</span><span class="seed-chip">Resident DiT / VAE</span><span class="seed-chip">Chunk Checkpoint</span><span class="seed-chip">Resume & Safe Stop</span><span class="seed-chip">CPU Offload / BlockSwap</span></div>""")
 
         # Paths and input sources
         with gr.Group():
             gr.Markdown("### 路径与输入任务")
             with gr.Row():
-                cli_path = gr.Textbox(label="inference_cli.py 路径", value=initial_cli, scale=5, placeholder="SeedVR2 项目目录/inference_cli.py", info="选择实际使用的 CLI 脚本。GUI 会通过该文件所在目录作为 CLI 工作目录。")
-                browse_cli_btn = gr.Button("浏览 CLI…", scale=1, variant="secondary", elem_classes=["seed-path-button"])
+                cli_path = gr.Textbox(label="SeedVR2 推理核心路径（同进程导入）", value=initial_cli, scale=5, interactive=False, info="此文件由当前 Gradio Python 进程直接导入；请将 GUI、运行时和 inference_cli.py 放在 SeedVR2 项目根目录，不再启动独立 CLI 子进程。")
+                browse_cli_btn = gr.Button("核心路径固定", scale=1, variant="secondary", interactive=False, elem_classes=["seed-path-button"])
                 output_root = gr.Textbox(label="输出根目录", value=cfg.get("output_root", str(APP_DIR / "outputs")), scale=4, info="每个输入任务会在该目录下创建独立输出子目录。")
                 browse_output_btn = gr.Button("浏览输出…", scale=1, variant="secondary", elem_classes=["seed-path-button"])
             with gr.Row():
@@ -1619,10 +1156,16 @@ def build_app() -> gr.Blocks:
         with gr.Tabs():
             with gr.Tab("模型与输出"):
                 with gr.Row():
-                    comps["dit_model"] = gr.Dropdown(label="DiT 模型", choices=model_choices, value=model_default, allow_custom_value=True, filterable=True, info="模型名称必须是当前 CLI model_registry 支持的选项。量化方式由模型文件格式/模型名决定。", scale=3)
+                    comps["dit_model"] = gr.Dropdown(label="DiT 模型名称 / 量化版本", choices=model_choices, value=model_default, allow_custom_value=True, filterable=True, info="从 model_registry 选择模型文件名；如使用独立权重路径，在下方指定路径，路径优先级更高。量化等级由权重文件决定。", scale=3)
                     reload_models_btn = gr.Button("刷新模型列表", scale=1, variant="secondary")
                 with gr.Row():
-                    comps["model_dir"] = gr.Textbox(label="模型目录（留空使用 CLI 默认）", value=cfg.get("model_dir", DEFAULTS["model_dir"]), scale=4, info="CLI --model_dir。留空时使用 CLI 自己的默认 models/SEEDVR2 目录。")
+                    comps["dit_model_path"] = gr.Textbox(label="DiT 主干模型文件路径（可选）", value=cfg.get("dit_model_path", ""), scale=5, placeholder="可填写完整 .safetensors / .gguf 路径", info="填写后优先使用该文件；留空则使用上面的 DiT 模型名和模型目录。")
+                    browse_dit_model_btn = gr.Button("选择 DiT 文件…", scale=1, variant="secondary", elem_classes=["seed-path-button"])
+                with gr.Row():
+                    comps["vae_model"] = gr.Textbox(label="VAE 模型文件名 / 完整路径", value=cfg.get("vae_model", DEFAULTS["vae_model"]), scale=5, placeholder="VAE 模型名或完整模型文件路径", info="填写文件名时从模型目录解析；填写完整路径时直接使用该文件。")
+                    browse_vae_model_btn = gr.Button("选择 VAE 文件…", scale=1, variant="secondary", elem_classes=["seed-path-button"])
+                with gr.Row():
+                    comps["model_dir"] = gr.Textbox(label="模型目录（留空使用默认目录）", value=cfg.get("model_dir", DEFAULTS["model_dir"]), scale=4, info="CLI --model_dir。DiT/VAE 文件名模式从该目录查找；如分别位于不同目录，可分别指定完整模型文件路径。")
                     browse_model_btn = gr.Button("浏览模型目录…", scale=1, variant="secondary", elem_classes=["seed-path-button"])
                 with gr.Row():
                     comps["output_format"] = gr.Dropdown(label="输出格式", choices=["auto", "mp4", "png"], value=cfg.get("output_format", DEFAULTS["output_format"]), info="auto 按输入媒体类型自动选择；视频可保存 MP4，图片输出 PNG。")
@@ -1639,7 +1182,7 @@ def build_app() -> gr.Blocks:
                     comps["skip_first_frames"] = num_dropdown("跳过开头帧数", "skip_first_frames", [0, 1, 2, 5, 10, 15, 30, 60, 120], "视频起始处跳过的帧数；图片输入不适用。支持自定义非负整数。")
                     comps["load_cap"] = num_dropdown("最多处理帧数（0=全部）", "load_cap", [0, 25, 50, 100, 200, 300, 500, 1000], "限制视频读取的最大帧数；0 表示处理全部可用帧。")
                 with gr.Row():
-                    comps["chunk_size"] = num_dropdown("Chunk Size（0=关闭流式）", "chunk_size", [0, 25, 50, 100, 200, 330, 660, 1000], "大于 0 时启用流式分块以降低长视频 RAM 峰值；0 表示不分块。")
+                    comps["chunk_size"] = num_dropdown("Chunk Size（0=单个大 Chunk）", "chunk_size", [0, 25, 50, 100, 200, 330, 660, 1000], "断点续处理以 Chunk 为最小提交单位。建议长视频设置 100–660；0 表示整个视频作为一个 Chunk，中断后只能重做这个视频。")
                     comps["prepend_frames"] = num_dropdown("Prepend Frames", "prepend_frames", [0, 1, 2, 4, 8, 16], "在开头加入反向帧缓解起始伪影；CLI 会在输出中移除这些前置帧。")
                     comps["temporal_overlap"] = num_dropdown("Temporal Overlap", "temporal_overlap", [0, 1, 2, 3, 4, 8, 12, 16], "相邻 Chunk 或多 GPU 分段的重叠帧数；与 Chunk Size 联动校验。")
                 with gr.Row():
@@ -1670,6 +1213,9 @@ def build_app() -> gr.Blocks:
                 comps["tile_debug"] = gr.Dropdown(label="Tile Debug", choices=["false", "encode", "decode"], value=cfg.get("tile_debug", "false"), info="可视化 VAE Tile；调试用，通常保持 false。")
             with gr.Tab("性能与缓存"):
                 with gr.Row():
+                    comps["keep_models_resident"] = gr.Checkbox(label="跨任务常驻 DiT / VAE（建议开启）", value=cfg.get("keep_models_resident", True), info="在当前 Gradio Python 进程中复用 DiT 与 VAE 权重。默认 Offload 到 CPU RAM，降低 8GB 显存压力；关闭后不主动保持模型缓存。")
+                    clear_model_cache_btn = gr.Button("清空模型缓存并释放显存", variant="secondary")
+                with gr.Row():
                     comps["attention_mode"] = gr.Dropdown(label="Attention Backend", choices=["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"], value=cfg.get("attention_mode", "sdpa"), info="注意力实现后端。SDPA 是 PyTorch 内置默认选项；其他后端需安装匹配依赖并满足硬件条件。")
                     comps["compile_backend"] = gr.Dropdown(label="Compile Backend", choices=["inductor", "cudagraphs"], value=cfg.get("compile_backend", "inductor"), info="torch.compile 编译后端；inductor 通常是默认选择。", interactive=bool(cfg.get("compile_dit") or cfg.get("compile_vae")))
                     comps["compile_mode"] = gr.Dropdown(label="Compile Mode", choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"], value=cfg.get("compile_mode", "default"), info="编译优化策略；更激进的模式可能增加首次编译时间和内存使用。", interactive=bool(cfg.get("compile_dit") or cfg.get("compile_vae")))
@@ -1696,9 +1242,10 @@ def build_app() -> gr.Blocks:
             component.change(fn=lambda value, k=key: _settings_changed(k, value), inputs=component, outputs=None, queue=False)
 
         # Native browsing buttons
-        browse_cli_btn.click(_browse_cli, inputs=[cli_path, comps["dit_model"], comps["blocks_to_swap"]], outputs=[cli_path, comps["dit_model"], comps["blocks_to_swap"], path_status], queue=False)
         browse_output_btn.click(lambda current: _browse_directory(current, "output"), inputs=output_root, outputs=[output_root, path_status], queue=False)
         browse_model_btn.click(lambda current: _browse_directory(current, "model"), inputs=comps["model_dir"], outputs=[comps["model_dir"], path_status], queue=False)
+        browse_dit_model_btn.click(_browse_dit_model_file, inputs=comps["dit_model_path"], outputs=[comps["dit_model_path"], path_status], queue=False)
+        browse_vae_model_btn.click(_browse_vae_model_file, inputs=comps["vae_model"], outputs=[comps["vae_model"], path_status], queue=False)
         browse_input_files_btn.click(_browse_input_files, inputs=[input_paths], outputs=[input_paths, path_status], queue=False)
         browse_input_folder_btn.click(_browse_input_folder, inputs=[input_paths], outputs=[input_paths, path_status], queue=False)
 
@@ -1709,6 +1256,7 @@ def build_app() -> gr.Blocks:
         comps["chunk_size"].change(_on_chunk_overlap_change, inputs=[comps["chunk_size"], comps["temporal_overlap"]], outputs=[comps["chunk_size"], comps["temporal_overlap"], resolution_hint], queue=False)
         comps["temporal_overlap"].change(_on_chunk_overlap_change, inputs=[comps["chunk_size"], comps["temporal_overlap"]], outputs=[comps["chunk_size"], comps["temporal_overlap"], resolution_hint], queue=False)
         comps["dit_model"].change(_on_model_change, inputs=[comps["dit_model"], comps["blocks_to_swap"]], outputs=[comps["blocks_to_swap"], resolution_hint], queue=False)
+        comps["dit_model_path"].change(_on_dit_path_change, inputs=[comps["dit_model_path"], comps["blocks_to_swap"]], outputs=[comps["blocks_to_swap"], resolution_hint], queue=False)
         block_link_inputs = [comps["blocks_to_swap"], comps["dit_offload_device"], comps["swap_io_components"], comps["dit_model"]]
         block_link_outputs = [comps["blocks_to_swap"], comps["dit_offload_device"], resolution_hint]
         comps["blocks_to_swap"].change(_on_blocks_change, inputs=block_link_inputs, outputs=block_link_outputs, queue=False)
@@ -1737,13 +1285,15 @@ def build_app() -> gr.Blocks:
             cuda_opts, offload_opts = build_device_choices(info)
             return (gr.update(choices=cuda_opts), gr.update(choices=offload_opts), gr.update(choices=offload_opts), gr.update(choices=offload_opts), info.get("note", "设备检测完成。"))
         refresh_devices_btn.click(refresh_devices, outputs=[comps["cuda_device"], comps["dit_offload_device"], comps["vae_offload_device"], comps["tensor_offload_device"], path_status], queue=False)
+        clear_model_cache_btn.click(_clear_model_cache, outputs=path_status, queue=False)
 
         with gr.Row(elem_classes=["seed-actions"]):
             submit_btn = gr.Button("提交作业 / 开始队列", variant="primary", scale=3)
             pause_btn = gr.Button("暂停", variant="secondary")
             resume_btn = gr.Button("恢复", variant="secondary", interactive=False)
-            stop_btn = gr.Button("终止当前及等待任务", variant="stop", interactive=False)
-            preview_btn = gr.Button("预览 CLI 命令", variant="secondary")
+            safe_stop_btn = gr.Button("安全停止（完成当前 Chunk）", variant="stop", interactive=False)
+            stop_btn = gr.Button("尽快终止（当前 Batch 边界）", variant="stop", interactive=False)
+            preview_btn = gr.Button("查看执行方案", variant="secondary")
         submit_status = gr.Markdown("就绪。请设置输入路径与模型参数。")
         preview_output = gr.Markdown()
         gr.Markdown("<div class='seed-muted'>参数提示：将鼠标悬停在参数名称旁的说明图标上，可查看参数用途与限制。数值下拉框允许输入自定义值；程序仍会在提交前检查合法性。</div>")
@@ -1753,7 +1303,7 @@ def build_app() -> gr.Blocks:
                 gr.Markdown("### 任务运行状态")
                 state_line = gr.Markdown("QUEUE IDLE")
                 progress_html = gr.HTML("<div class='progress-wrap'>等待提交任务。</div>")
-                log_view = gr.Textbox(label="实时 CLI 日志", lines=18, max_lines=28, interactive=False, autoscroll=True)
+                log_view = gr.Textbox(label="实时推理日志", lines=18, max_lines=28, interactive=False, autoscroll=True)
             with gr.Column(scale=2):
                 gr.Markdown("### 作业队列 / 最近记录")
                 jobs_table = gr.Dataframe(headers=["ID", "Status", "Input", "Progress", "Elapsed", "Output"], value=[], interactive=False, wrap=True)
@@ -1780,6 +1330,7 @@ def build_app() -> gr.Blocks:
         pause_btn.click(_pause, outputs=submit_status, queue=False)
         resume_btn.click(_resume, outputs=submit_status, queue=False)
         stop_btn.click(_stop, outputs=submit_status, queue=False)
+        safe_stop_btn.click(_safe_stop, outputs=submit_status, queue=False)
         preview_btn.click(_preview, inputs=[input_paths, cli_path, output_root] + param_components, outputs=preview_output, queue=False)
         reload_models_btn.click(_reload_model_choices, inputs=[cli_path, comps["dit_model"], comps["blocks_to_swap"]], outputs=[comps["dit_model"], comps["blocks_to_swap"], submit_status], queue=False)
         restore_btn.click(_restore_history, inputs=history_select,
@@ -1796,8 +1347,8 @@ def build_app() -> gr.Blocks:
         load_outputs = [cli_path, input_paths, output_root] + param_components + [startup_status]
         demo.load(lambda: _load_config_outputs(load_outputs), outputs=load_outputs, queue=False)
         timer = gr.Timer(1.0)
-        timer.tick(_refresh, outputs=[state_line, progress_html, log_view, jobs_table, stop_btn, pause_btn, resume_btn], queue=False)
-        gr.Markdown("<div class='seed-muted'>安全说明：推理任务以独立 CLI 子进程运行。提交按钮具备短时间重复提交抑制；暂停/恢复/终止均为幂等操作。强制终止可能使当前输出文件不完整；请检查输出目录后再复用。</div>")
+        timer.tick(_refresh, outputs=[state_line, progress_html, log_view, jobs_table, stop_btn, safe_stop_btn, pause_btn, resume_btn], queue=False)
+        gr.Markdown("<div class='seed-muted'>安全说明：推理在同一个 Python 进程内执行。安全停止会完成当前 Chunk、关闭临时视频并提交 checkpoint；尽快终止会在下一个模型 Batch 回调边界中断，当前 Chunk 不提交。暂停同样在 Batch 回调边界生效。相同输入和参数再次提交时从最后一个有效 Chunk 恢复。单 GPU 路径支持模型跨任务常驻缓存。多 GPU 保留原生 multiprocessing 回退，但不具备同等级别的常驻缓存和 Chunk 断点恢复，且 worker 推理期间不能响应暂停/停止请求；长视频建议使用单 GPU。</div>")
 
     demo._seedvr2_theme = theme
     demo._seedvr2_css = css

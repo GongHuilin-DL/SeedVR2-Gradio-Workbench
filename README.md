@@ -1,132 +1,208 @@
 # SeedVR2 Gradio Workbench
 
-A local Gradio GUI for the supplied `inference_cli.py`. The application **does not reimplement the SeedVR2 inference pipeline**; each queued item is launched as an independent CLI subprocess so the model loading, model downloads, multi-GPU handling, streaming, caching, tiling and output behavior remain owned by the CLI.
-<img src="assets/1.png" alt="演示" width="1296" />
-<img src="assets/2.png" alt="演示" width="1296" />
-<img src="assets/3.png" alt="演示" width="1296" />
-## 1. Installation
+A local Gradio workbench for SeedVR2. The inference engine and task manager run inside the same Python process, enabling resident DiT/VAE caches, resumable chunk processing, cooperative pause/stop controls, and an editable parameter interface.
 
-Place `seedvr2_gradio.py` in the same directory as `inference_cli.py`, in the SeedVR2 project root (the directory that contains the `src/` package):
+> **Important:** This repository provides the SeedVR2 GUI + runtime integration layer, along with a modified `inference_cli.py`. It does not re-package the upstream SeedVR2 `src/` source code, model weights, or large dependencies. Before use, you need to prepare a compatible SeedVR2 project directory.
+
+---
+
+## 1. Main features / 主要功能
+
+### In-process inference and resident models
+
+- Gradio task manager imports `inference_cli.py` and calls its inference functions directly. It does not create a new CLI subprocess for every file.
+- A serial worker executes queued tasks to avoid multiple independent model instances competing for VRAM.
+- DiT and VAE can be retained through the upstream global model cache across tasks in the same application process.
+- Model identity is tracked using resolved file path, file size and modification time. Changing the actual DiT/VAE weights evicts the old cache entries; changing execution settings rebuilds transient context while retaining reusable weights when possible.
+- The default **Keep Models Resident** policy enables both caches. When DiT/VAE offload is set to `none`, the runtime uses CPU RAM offload to reduce VRAM pressure. This is a policy choice, not a guarantee that weights remain physically in VRAM.
+- Use **Clear Model Cache and Release VRAM** when you need to explicitly unload cached weights. Closing the Gradio Python process also releases its model objects.
+
+### Chunk-level checkpoint and resume
+
+For single-GPU video processing:
+
+1. The input is read as a sequence of new-frame ranges. `chunk_size=0` means one Chunk for the entire video; a positive value enables multiple Chunks.
+2. Each completed Chunk is written to a separate temporary file (`.partial.mp4`) or temporary PNG directory.
+3. The writer is closed, the file is checked, and the temporary artifact is atomically renamed to its committed Chunk name.
+4. Only after the Chunk artifact is committed does the runtime atomically update `checkpoint/checkpoint.json`.
+5. After all Chunks are committed, MP4 Chunks are concatenated into the final video. FFmpeg stream-copy is preferred; OpenCV re-encoding is the fallback for the OpenCV backend. The merged frame count is checked before the final file is promoted.
+6. A subsequent submission with the same source, model weights and parameters reuses valid committed Chunks and processes only the remaining ones.
+
+The checkpoint fingerprint includes source path/stat information, parameters, model identities and engine file identity. If the source file, model weights or processing parameters change, the runtime creates a different run directory rather than mixing incompatible Chunks.
+
+The resume path decodes the previous source-frame overlap from the original input before processing the next Chunk. This restores temporal context instead of resuming at a hard boundary with no context.
+
+### Task controls
+
+- **Pause**: pauses cooperatively at the next model Batch callback. The process and model memory remain allocated.
+- **Resume**: continues a paused task.
+- **Safe Stop**: finishes the current Chunk, closes the writer, commits its checkpoint, then stops before starting the next Chunk. Waiting jobs are cancelled.
+- **Immediate Stop**: requests cancellation at the next available model Batch callback. The current incomplete Chunk is not checkpointed; previously committed Chunks remain available for resume. Python/CUDA work is not force-killed from another thread because doing so is unsafe for an in-process runtime.
+- **Submit again**: submit the same input and settings to resume from the last valid checkpoint.
+
+### Parameters and model selection
+
+- DiT model: choose a registered model/quantization or specify an explicit local weight file.
+- VAE model: type a registry filename or explicit local path.
+- Both DiT and VAE support a native Windows file picker and direct text entry.
+- The GUI retains the previous parameter sections for input/output, resolution, batch, noise, temporal overlap, devices, offload, BlockSwap, VAE tiling, attention, `torch.compile`, caching and debug logging.
+- Parameter fields include contextual help, and submission validation checks common cross-field constraints (4n+1 Batch Size, temporal overlap vs Chunk Size, VAE tile overlap vs tile size, 10-bit vs FFmpeg, BlockSwap vs offload, model-specific BlockSwap limits, device IDs and paths).
+
+## 2. Project structure
 
 ```text
-SeedVR2/
-├── inference_cli.py
-├── seedvr2_gradio.py
-├── src/
-├── models/
-└── ...
+SeedVR2-Gradio-Workbench/
+├── inference_cli.py              # Modified upstream CLI / in-process inference API
+├── seedvr2_runtime.py            # Task queue, resident cache, Chunk/checkpoint engine
+├── seedvr2_gradio.py             # Gradio user interface
+├── tests/
+│   ├── conftest.py
+│   ├── test_chunk_resume.py
+│   └── test_progress_api_guard.py
+├── README.md
+├── requirements.txt
+├── requirements-dev.txt
+├── LICENSE
+├── NOTICE
+└── .gitignore
 ```
 
-Activate the same Conda environment that already runs SeedVR2, then install the GUI dependencies:
+This is an integration overlay rather than a self-contained copy of the complete SeedVR2 upstream source tree. Do not add model weights, local input videos, generated outputs or your local config/history files to Git.
+
+## 3. Requirements
+
+- Windows 10/11 or Linux (native file dialogs are intended for local desktop sessions).
+- Python 3.10+.
+- A working SeedVR2 environment with PyTorch, the matching CUDA build (for NVIDIA GPUs), OpenCV, NumPy and all upstream SeedVR2 dependencies.
+- The SeedVR2 source tree must be compatible with the paired `inference_cli.py`. The Workbench checks for the required `progress_callback` hooks before loading models. If the installed `src/core/generation_phases.py` does not expose these callbacks, the task will fail early with an explicit compatibility error.
+- FFmpeg is recommended for reliable chunk concatenation and required for the FFmpeg / 10-bit output backend. `ffprobe` is recommended for more reliable video frame-count validation.
+
+Do **not** reinstall PyTorch or CUDA just to install this GUI. Use the Conda environment that already runs your SeedVR2 CLI.
+
+## 4. Installation (Windows / Conda)
+
+### 4.1 Prepare the upstream SeedVR2 tree
+
+Clone or use an existing compatible SeedVR2 project. The integration target is the project root containing `src/`, `models/` and the upstream Python modules.
+
+Upstream project: <https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler>
+
+### 4.2 Copy the Workbench files
+
+Copy these files to the SeedVR2 project root, alongside the `src/` directory:
+
+- `inference_cli.py` (back up the original first; this repository includes the modified paired version)
+- `seedvr2_runtime.py`
+- `seedvr2_gradio.py`
+
+Keep the `tests/`, `README.md`, `requirements.txt`, `LICENSE`, `NOTICE` and `.gitignore` in your Workbench Git repository. The GUI/runtime files can also live in the upstream project root for local execution.
+
+### 4.3 Install GUI dependency
 
 ```powershell
 conda activate seedvr2
-python -m pip install -r requirements-seedvr2-gradio.txt
+python -m pip install -r requirements.txt
 ```
 
-Or install directly:
+The requirements file intentionally installs only Gradio. PyTorch, CUDA, OpenCV, NumPy and other SeedVR2 dependencies should remain at the versions already configured for your inference environment.
 
-```powershell
-python -m pip install "gradio>=4.44,<7" "psutil>=5.9"
-```
+### 4.4 Start
 
-PyTorch, CUDA, OpenCV and the SeedVR2 dependencies are expected to be installed already. Do not replace your working PyTorch/CUDA build just to install this GUI.
-
-## 2. Start
-
-From the SeedVR2 project root:
+Run from the SeedVR2 project root:
 
 ```powershell
 python seedvr2_gradio.py
 ```
 
-Open `http://127.0.0.1:7860` if the browser does not open automatically. The GUI binds to localhost by default.
+Then open:
 
-Optional environment variables:
+```text
+http://127.0.0.1:7860
+```
+
+Optional host/port configuration:
 
 ```powershell
 $env:SEEDVR2_GRADIO_HOST="127.0.0.1"
 $env:SEEDVR2_GRADIO_PORT="7860"
-$env:SEEDVR2_CLI="D:\AI\SeedVR2\inference_cli.py"
 python seedvr2_gradio.py
 ```
 
-Only expose the server on `0.0.0.0` when you intentionally need LAN access and understand that the GUI can launch inference jobs and terminate processes.
+Only bind to `0.0.0.0` when LAN access is intentional and the host is appropriately protected. The GUI can launch local model inference and access files available to the Python process.
 
-## 3. Input and batch behavior
+## 5. Recommended settings for 8 GB laptop GPUs
 
-- Enter one absolute file path or directory path per line in the input box.
-- You can also multi-select files in the upload area; uploaded paths are appended to the input box.
-- A directory is submitted as **one CLI job**, and the CLI performs its native directory batch processing. This preserves the CLI's `cache_dit` / `cache_vae` behavior for directory jobs.
-- Several independent file paths become several queue jobs. They run serially, one CLI process at a time, to avoid concurrent model instances competing for VRAM.
-- Each submitted source is written into its own output subdirectory under the selected output root, avoiding collisions between files with the same basename.
+For an 8 GB RTX 4070 Laptop GPU, start conservatively:
 
-For durable restoration after restarting the app, prefer stable absolute file paths. Uploaded files can be stored in Gradio's temporary upload/cache directory, and that temporary path may not survive cache cleanup or a later restart.
+- Use a 3B FP8 or other memory-appropriate DiT weight.
+- Enable **Keep Models Resident**.
+- Leave DiT/VAE offload at `none` initially; the resident policy will use CPU RAM offload for these model families. You may also choose `cpu` explicitly.
+- Keep `tensor_offload_device=cpu`.
+- Start with `batch_size=5` or `9` and a moderate output resolution.
+- Enable VAE tiling if the VAE encode/decode phase has a VRAM peak.
+- For long videos, set `chunk_size` to a positive value such as `100`, `200` or `330`; keep `temporal_overlap` smaller than the Chunk Size.
+- Avoid enabling `torch.compile` until a stable non-compiled run works; first-time compilation can consume additional time and memory.
 
-## 4. Task controls and safety semantics
+These are starting points rather than guaranteed settings. Actual VRAM use depends on input resolution, model variant, quantization, attention backend, offload and tile settings.
 
-- **Submit**: validates paths and parameters, suppresses identical double-click submissions for a short debounce interval, then adds queue jobs.
-- **Pause**: with `psutil` installed, suspends the CLI process and its child processes. This is an OS-level pause: GPU memory remains allocated while paused. If process suspension is unavailable, the pause request is retained and the queue pauses at the current job boundary; the log reports this explicitly.
-- **Resume**: resumes the suspended process tree or releases a queue-boundary pause.
-- **Terminate**: terminates the active CLI process tree and marks waiting jobs cancelled. The current output may be incomplete and should be checked before use.
-- Repeated pause, resume and terminate clicks are treated idempotently. A single worker serializes inference jobs.
+## 6. Resume workflow
 
-## 5. Configuration and history
+1. Submit a video with `chunk_size > 0`.
+2. Use **Safe Stop** to stop at a committed Chunk boundary, or **Immediate Stop** to abandon the currently running Chunk at its next Batch callback.
+3. Check the task output directory if you need to inspect committed temporary files. Do not treat uncommitted `.partial` files as valid results.
+4. Submit the same source again with the same model paths, output root and parameters. The runtime finds the matching run fingerprint and validates the committed Chunk files before resuming.
+5. After the final Chunk, the application creates the final MP4 and marks the manifest complete.
 
-The application writes these files beside `seedvr2_gradio.py`:
+A cancelled task is not a failed checkpoint. The history record stores task inputs and parameters; use **Restore to Workspace** and submit again. The output/checkpoint directory is not removed when history entries are deleted.
 
-- `seedvr2_gradio_config.json`: all visible CLI parameters, CLI path, input paths and output root. Changes are auto-saved atomically; there is also a manual full-save button.
-- `seedvr2_gradio_history.json`: task inputs, parameter snapshots, status, timing, output paths, command and recent CLI logs.
+### What is and is not resumable
 
-At startup, the GUI restores the last UI configuration. If the configuration or history JSON is damaged, the application attempts to preserve a `.corrupt-<timestamp>` backup and continues with defaults or an empty history. Jobs that were running when the app stopped are marked `interrupted`; they are not automatically relaunched. Use the history restore button to reload an interrupted job's input and parameters, then submit again.
+- Single-GPU video processing: Chunk-level checkpoint and resume.
+- PNG sequence output: Chunk directories are committed and collected into a final numbered sequence directory.
+- Single-image processing: runs through the upstream image pipeline in-process, but does not need video Chunk checkpoints.
+- Multi-GPU processing: compatibility fallback to the upstream native multiprocessing path; it does not currently provide the same resident cache or Chunk-resume guarantees. Pause/stop controls cannot interrupt an active multi-GPU worker run; use single GPU for long resumable videos.
+- An interrupted Chunk is recomputed from its beginning. Only successfully committed earlier Chunks are reused.
+- The current pipeline writes the enhanced video frames; it does not preserve or remux the source video's audio track.
 
-Deleting an individual history record requires a confirmation checkbox. Clearing all history also requires explicit confirmation and is blocked while jobs are queued or running. History deletion does not delete generated output files.
+## 7. Output layout
 
-## 6. CLI parameter coverage
+```text
+outputs/
+└── source_name_<source-id>/
+    └── runs/
+        └── <run-fingerprint>/
+            └── source_name_<source-id>/
+                ├── checkpoint/
+                │   ├── checkpoint.json
+                │   └── chunks/
+                │       ├── chunk_000001.mp4
+                │       ├── chunk_000002.mp4
+                │       └── ...
+                └── source_name_SeedVR2.mp4
+```
 
-The GUI exposes all options declared by the supplied `inference_cli.py` parser:
+The exact run path is shown in the task history. Checkpoint files and output artifacts are not automatically deleted by the GUI.
 
-- Input/output: positional input, `--output`, `--output_format`, `--video_backend`, `--10bit`, `--model_dir`
-- Model: `--dit_model`
-- Processing: `--resolution`, `--max_resolution`, `--batch_size`, `--uniform_batch_size`, `--seed`, `--skip_first_frames`, `--load_cap`, `--chunk_size`, `--prepend_frames`, `--temporal_overlap`
-- Quality: `--color_correction`, `--input_noise_scale`, `--latent_noise_scale`
-- Devices: `--cuda_device` (where supported), `--dit_offload_device`, `--vae_offload_device`, `--tensor_offload_device`
-- Memory: `--blocks_to_swap`, `--swap_io_components`, all VAE encode/decode tiling options and `--tile_debug`
-- Performance: `--attention_mode`, all `torch.compile` options
-- Caching/debug: `--cache_dit`, `--cache_vae`, `--debug`
+## 8. Development and tests
 
-Model choices are queried from the project's `src.utils.model_registry.get_available_dit_models()` where possible. If the CLI path is changed, use **刷新模型列表** to re-read the choices from that project.
+Run CPU-only regression tests from the Workbench directory:
 
-## 7. Progress reporting notes
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+```
 
-The CLI does not expose a structured callback for every internal inference phase. The GUI therefore streams the full stdout/stderr log and derives a percentage only when the CLI emits recognizable `Chunk N/M` or `Processing file N/M` messages. In other phases the task status and logs remain live, but the numeric progress may remain unchanged. This avoids inventing progress values that the CLI does not provide.
+The checkpoint test creates a synthetic 25-frame video, requests a safe stop after the first 10-frame Chunk, then verifies that the remaining Chunks resume and merge into a 25-frame output. These tests validate the checkpoint/merge orchestration; they do not replace a real GPU inference test with the user's installed SeedVR2 models.
 
-## 8. Operational notes
+## 9. Known limitations
 
-- Run the GUI in the same Python environment and SeedVR2 project checkout as the CLI.
-- If a model/attention backend is not installed, the CLI will fail and the complete error will be shown in the log/history.
-- `--10bit` requires FFmpeg and `video_backend=ffmpeg`.
-- BlockSwap requires a non-`none` DiT offload device; the GUI validates common incompatible combinations before queueing.
-- A directory is one CLI invocation; individual input paths are separate CLI invocations. Model cache is therefore preserved within native directory/streaming workflows, not between separate queue processes.
+- The in-process engine binds to the first imported `inference_cli.py` for the lifetime of the GUI. Restart the GUI to switch to a different SeedVR2 source directory.
+- Cooperative pause/stop takes effect at the next upstream phase Batch callback. A single currently executing GPU kernel or batch is not pre-empted mid-operation.
+- A sudden power loss during a Chunk can leave a `.partial` artifact. It is not added to the checkpoint; the previous committed Chunk remains reusable.
+- Model weights stay resident only while the Gradio Python process is alive and the selected cache policy keeps them. Model switching intentionally evicts the previous DiT/VAE cache entries.
+- Multi-GPU behavior retains the upstream CLI fallback and is not equivalent to the single-GPU checkpoint path.
+- Native Explorer dialogs require the Gradio Python process to run on the local desktop. When running remotely, type server-side absolute paths or use Gradio upload. For durable history/resume, prefer stable absolute input paths over temporary Gradio upload-cache paths.
 
+## 10. License and attribution
 
-## 9. Enhanced path pickers, dropdowns and linked validation
-
-The current GUI version adds the following controls while retaining the original CLI subprocess scheduler and all 43 UI parameter mappings:
-
-- **CLI path**: `浏览 CLI…` opens a native file dialog. The selected file must be named `inference_cli.py`; after selection, the app refreshes model candidates from that project's `src.utils.model_registry` where available.
-- **Output root / model directory**: `浏览输出…` and `浏览模型目录…` open native folder dialogs. An empty model-directory field deliberately omits `--model_dir`, allowing the CLI's own default model path to be used.
-- **Input selection**: native multi-file and folder dialogs append selected paths to the input list. Manual absolute paths and Gradio uploads remain supported.
-- **Editable dropdowns**: target resolution, max edge, Batch Size, skip-frame count, frame cap, chunk size, prepend frames, temporal overlap, BlockSwap, VAE tile sizes/overlaps, and Dynamo cache/recompile limits provide common values while allowing custom entries. Seed remains a free numeric field because it is commonly an arbitrary integer.
-- **Batch Size normalization**: the UI enforces `4n+1` and automatically updates illegal or out-of-range values to the nearest bounded valid value, with a message shown beside the controls. Submission validates the normalized integer again.
-- **Local device discovery**: CUDA GPU names/IDs and Apple MPS availability are queried using the Python environment that launches Gradio. The device dropdowns include the detected devices and accept custom entries; submission checks the syntax and detected device range.
-- **Linked settings**: enabling BlockSwap / Swap I/O with DiT offload set to `none` switches it to `cpu`; enabling DiT/VAE cache with the corresponding offload set to `none` also selects `cpu`; changing 3B/7B updates the BlockSwap maximum; Tile Overlap must remain smaller than Tile Size; with streaming enabled, Temporal Overlap must be smaller than Chunk Size; 10-bit output switches to FFmpeg and is rejected if FFmpeg is unavailable.
-- **Help text**: parameter descriptions are shown through Gradio's built-in information hints. Dropdowns with custom entry enabled still undergo submit-time range and relationship checks.
-
-### Native dialog note
-
-The native dialogs use Python's standard-library `tkinter.filedialog`. They are designed for a Gradio server started on the same desktop as the browser. When running on a headless server, WSL without a GUI, Docker without display forwarding, or a remote host, the native dialog may not open; the app reports the error and users can paste an absolute path into the text field. Gradio's upload control remains available for file uploads but does not replace a server-side folder path.
-
-### Validation and relationships
-
-The GUI validates CLI existence, input formats and directory contents, model-directory existence when specified, integer ranges, `4n+1` Batch Size, model-specific BlockSwap maxima (3B: 32, 7B: 36), CUDA/offload device strings, tile overlap constraints, streaming overlap, output-format compatibility with image inputs, FFmpeg availability, and the 10-bit/FFmpeg dependency. The CLI remains authoritative for model loading and runtime hardware/backend support; successful GUI validation does not guarantee that a given model fits in VRAM or that an optional attention/compile backend is installed.
+The project is distributed under Apache License 2.0. The included `inference_cli.py` is derived from the upstream `numz/ComfyUI-SeedVR2_VideoUpscaler` implementation and contains Workbench modifications; see `NOTICE` and `LICENSE`. SeedVR2 model weights and third-party packages remain subject to their own licenses and terms.

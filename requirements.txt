@@ -1,3 +1,5 @@
-# Install these into the same Conda environment used by SeedVR2.
+# Install into the same Conda environment that already runs SeedVR2.
+# PyTorch, CUDA, OpenCV, NumPy and the SeedVR2 source dependencies are expected
+# to be installed by the upstream SeedVR2 environment; this file does not
+# replace or upgrade those packages.
 gradio>=4.44,<7
-psutil>=5.9
