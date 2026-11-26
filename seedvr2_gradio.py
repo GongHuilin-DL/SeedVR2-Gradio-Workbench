@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import collections
 import datetime as dt
+from decimal import Decimal, InvalidOperation
 import hashlib
 import itertools
 import math
@@ -151,6 +152,34 @@ VALUE_CHOICES = {
     "compile_backend": {"inductor", "cudagraphs"},
     "compile_mode": {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"},
 }
+
+# Numeric contracts shared by UI callbacks, submission validation and Runtime hand-off.
+# Values are validated before any parameter dictionary is persisted or submitted.
+INT_PARAMETER_RANGES = {
+    "resolution": (1, 16384),
+    "max_resolution": (0, 32768),
+    "batch_size": (1, 1001),
+    "seed": (-2147483648, 2147483647),
+    "skip_first_frames": (0, 100000000),
+    "load_cap": (0, 100000000),
+    "chunk_size": (0, 1000000),
+    "prepend_frames": (0, 10000),
+    "temporal_overlap": (0, 10000),
+    "blocks_to_swap": (0, 36),
+    "vae_encode_tile_size": (64, 8192),
+    "vae_decode_tile_size": (64, 8192),
+    "vae_encode_tile_overlap": (0, 8191),
+    "vae_decode_tile_overlap": (0, 8191),
+    "compile_dynamo_cache_size_limit": (1, 100000),
+    "compile_dynamo_recompile_limit": (1, 100000),
+}
+FLOAT_PARAMETER_RANGES = {
+    "input_noise_scale": (0.0, 1.0),
+    "latent_noise_scale": (0.0, 1.0),
+}
+INT_PARAMETER_KEYS = set(INT_PARAMETER_RANGES)
+FLOAT_PARAMETER_KEYS = set(FLOAT_PARAMETER_RANGES)
+NUMERIC_PARAMETER_KEYS = INT_PARAMETER_KEYS | FLOAT_PARAMETER_KEYS
 
 DEVICE_INFO_CACHE: Optional[Dict[str, Any]] = None
 # Values in this set are persisted by their coupled callbacks to avoid a race
@@ -524,14 +553,124 @@ def build_device_choices(device_info: Dict[str, Any]) -> Tuple[List[Tuple[str, s
     return cuda_choices, offload_choices
 
 
-def _normalise_batch_size(value: Any) -> Tuple[Any, str]:
+def _strict_int(value: Any, key: str) -> int:
+    """Convert an integer-like UI value without accepting fractions, NaN or infinity."""
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"{key} 必须是整数，当前值为 {value!r}。")
     try:
-        numeric = float(value)
-        if not math.isfinite(numeric):
-            raise ValueError("非有限数值")
+        number = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError, TypeError, AttributeError) as exc:
+        raise ValueError(f"{key} 必须是整数，当前值为 {value!r}。") from exc
+    if not number.is_finite() or number != number.to_integral_value():
+        raise ValueError(f"{key} 必须是有限整数，当前值为 {value!r}。")
+    return int(number)
+
+
+def _strict_float(value: Any, key: str) -> float:
+    """Convert a numeric UI value to a finite float; reject bool/blank/non-finite input."""
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"{key} 必须是有效数值，当前值为 {value!r}。")
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{key} 必须是有效数值，当前值为 {value!r}。") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{key} 必须是有限数值，当前值为 {value!r}。")
+    return number
+
+
+def _strict_bool(value: Any, key: str) -> bool:
+    """Normalize Gradio checkbox-like values to an actual bool."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    raise ValueError(f"{key} 必须是布尔值，当前值为 {value!r}。")
+
+
+def _normalize_parameter_value(key: str, value: Any) -> Any:
+    """Return one parameter in the exact Python type expected by the CLI/Runtime."""
+    if key not in DEFAULTS:
+        raise KeyError(f"未知参数：{key}")
+
+    default = DEFAULTS[key]
+    if isinstance(default, bool):
+        normalized = _strict_bool(value, key)
+    elif isinstance(default, int) and not isinstance(default, bool):
+        normalized = _strict_int(value, key)
+        bounds = INT_PARAMETER_RANGES.get(key)
+        if bounds is not None and not bounds[0] <= normalized <= bounds[1]:
+            raise ValueError(f"{key} 必须在 {bounds[0]} 到 {bounds[1]} 之间，当前值为 {normalized}。")
+        if key == "batch_size" and normalized % 4 != 1:
+            raise ValueError("batch_size 必须满足 4n+1，例如 1、5、9、13、17。")
+    elif isinstance(default, float):
+        normalized = _strict_float(value, key)
+        bounds = FLOAT_PARAMETER_RANGES.get(key)
+        if bounds is not None and not bounds[0] <= normalized <= bounds[1]:
+            raise ValueError(f"{key} 必须在 {bounds[0]} 到 {bounds[1]} 之间，当前值为 {normalized}。")
+    else:
+        normalized = str(default if value is None else value).strip()
+
+    if key in VALUE_CHOICES and normalized not in VALUE_CHOICES[key]:
+        allowed = ", ".join(sorted(VALUE_CHOICES[key]))
+        raise ValueError(f"{key} 只能选择：{allowed}。")
+
+    # Normalize device tokens consistently while keeping them strings for the CLI.
+    if key in {"dit_offload_device", "vae_offload_device", "tensor_offload_device"}:
+        normalized = normalized.lower()
+    if key == "cuda_device":
+        normalized = normalized.replace(" ", "")
+    return normalized
+
+
+def normalize_ui_parameters(values: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """Normalize every UI parameter; invalid fields fall back internally but are reported.
+
+    Callers must not submit when errors is non-empty. Using defaults for invalid fields
+    keeps follow-up validation/preview code from crashing while the user sees the error.
+    """
+    normalized: Dict[str, Any] = {}
+    errors: List[str] = []
+    for key, default in DEFAULTS.items():
+        raw_value = values.get(key, default)
+        try:
+            normalized[key] = _normalize_parameter_value(key, raw_value)
+        except (TypeError, ValueError, OverflowError, KeyError) as exc:
+            normalized[key] = default
+            errors.append(f"{key}：{exc}")
+    return normalized, errors
+
+
+def _on_numeric_parameter_change(key: str, value: Any) -> Tuple[Any, str]:
+    """Convert hand-entered Dropdown/Number/Slider values and autosave only valid data."""
+    try:
+        normalized = _normalize_parameter_value(key, value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return gr.update(), f"⚠️ {key} 输入无效，未保存：{exc}"
+
+    save_note = save_config_values({key: normalized})
+    changed_type = not isinstance(value, type(normalized))
+    changed_value = value != normalized
+    if changed_type or changed_value:
+        note = f"✓ {key} 已转换为 {type(normalized).__name__}：{normalized}。{save_note}"
+    else:
+        note = f"✓ {key} 参数合法。{save_note}"
+    return gr.update(value=normalized), note
+
+
+def _normalise_batch_size(value: Any, persist: bool = True) -> Tuple[Any, str]:
+    """Preserve the UI's existing 4n+1 correction while always returning an int."""
+    try:
+        numeric = _strict_float(value, "batch_size")
     except (TypeError, ValueError, OverflowError):
-        numeric = 5.0
-        source_note = "输入不是有效数字，已回退到默认值 5；"
+        numeric = float(DEFAULTS["batch_size"])
+        source_note = f"输入 {value!r} 不是有效数字，已回退到默认值 5；"
     else:
         source_note = ""
     rounded = int(round(numeric))
@@ -542,7 +681,8 @@ def _normalise_batch_size(value: Any) -> Tuple[Any, str]:
         msg = f"{source_note}Batch Size 输入 {value!r} 不满足整数且 4n+1 的约束，已自动修正为 {corrected}。"
     else:
         msg = f"{source_note}Batch Size 合法：{corrected}（满足 4n+1）。"
-    save_config_values({"batch_size": corrected})
+    if persist:
+        save_config_values({"batch_size": corrected})
     return gr.update(value=corrected), msg
 
 
@@ -590,7 +730,7 @@ def _on_blocks_change(blocks: Any, dit_offload: str, swap_io: bool, model_name: 
         return gr.update(), gr.update(), "BlockSwap 必须是整数；未修改当前配置。"
     limit = _model_block_limit(model_name)
     fixed = min(value, limit)
-    block_update = gr.update(value=fixed) if fixed != value else gr.update()
+    block_update = gr.update(value=fixed) if (fixed != value or not isinstance(blocks, int) or isinstance(blocks, bool)) else gr.update()
     if fixed != value:
         save_config_values({"blocks_to_swap": fixed})
         note = f"当前模型 BlockSwap 上限为 {limit}，已将 {value} 修正为 {fixed}。"
@@ -616,7 +756,11 @@ def _on_tiling_toggle(enabled: bool, tile_size: Any, tile_overlap: Any, overlap_
         save_config_values({tiled_key: bool(enabled), overlap_key: fixed})
         return gr.update(interactive=True), gr.update(interactive=True, value=fixed), f"Tile Overlap 必须小于 Tile Size，已修正为 {fixed}。"
     save_config_values({tiled_key: bool(enabled), overlap_key: overlap})
-    return gr.update(interactive=bool(enabled)), gr.update(interactive=bool(enabled)), "VAE Tiling 参数状态已更新。"
+    return (
+        gr.update(interactive=bool(enabled), value=size),
+        gr.update(interactive=bool(enabled), value=overlap),
+        "VAE Tiling 参数状态已更新。",
+    )
 
 
 def _on_video_backend_change(backend: str, use_10bit: bool) -> Tuple[Any, str]:
@@ -651,7 +795,8 @@ def _on_tile_overlap_change(overlap: Any, tile_size: Any, key: str) -> Tuple[Any
         save_config_values({key: fixed})
         return gr.update(value=fixed), f"Overlap 必须小于 Tile Size，已自动修正为 {fixed}。"
     save_config_values({key: ov})
-    return gr.update(), "Tile 参数合法。"
+    update = gr.update(value=ov) if (not isinstance(overlap, int) or isinstance(overlap, bool)) else gr.update()
+    return update, "Tile 参数合法。"
 
 
 def _on_tile_size_change(tile_size: Any, overlap: Any, size_key: str, overlap_key: str) -> Tuple[Any, Any, str]:
@@ -662,14 +807,14 @@ def _on_tile_size_change(tile_size: Any, overlap: Any, size_key: str, overlap_ke
     if size < 64:
         size = 64
         save_config_values({size_key: size})
-    overlap_update = gr.update()
+    overlap_update = gr.update(value=ov) if (not isinstance(overlap, int) or isinstance(overlap, bool)) else gr.update()
     note = "Tile Size / Overlap 合法。"
     if ov < 0 or ov >= size:
         fixed = max(0, min(128, size // 4))
         save_config_values({overlap_key: fixed})
         overlap_update = gr.update(value=fixed)
         note = f"Tile Size 变化后，Overlap 已自动调整为 {fixed}（必须满足 0 ≤ Overlap < Tile Size）。"
-    size_update = gr.update(value=size) if size != _strict_int(tile_size, "tile_size") else gr.update()
+    size_update = gr.update(value=size) if (size != _strict_int(tile_size, "tile_size") or not isinstance(tile_size, int) or isinstance(tile_size, bool)) else gr.update()
     prefix = "vae_encode" if size_key.startswith("vae_encode") else "vae_decode"
     save_config_values({size_key: size, prefix + "_tile_overlap": max(0, min(ov, size - 1)) if ov >= size or ov < 0 else ov})
     return size_update, overlap_update, note
@@ -706,30 +851,31 @@ def _on_chunk_overlap_change(chunk_size: Any, overlap: Any) -> Tuple[Any, Any, s
     if chunk > 0 and ov >= chunk:
         fixed = max(0, chunk - 1)
         save_config_values({"chunk_size": chunk, "temporal_overlap": fixed})
-        return gr.update(), gr.update(value=fixed), f"流式处理要求 Temporal Overlap 小于 Chunk Size；已将 Overlap 自动调整为 {fixed}。"
+        chunk_update = gr.update(value=chunk) if (not isinstance(chunk_size, int) or isinstance(chunk_size, bool)) else gr.update()
+        return chunk_update, gr.update(value=fixed), f"流式处理要求 Temporal Overlap 小于 Chunk Size；已将 Overlap 自动调整为 {fixed}。"
     save_config_values({"chunk_size": chunk, "temporal_overlap": ov})
-    return gr.update(), gr.update(), "Chunk Size 与 Temporal Overlap 设置正常。"
+    chunk_update = gr.update(value=chunk) if (not isinstance(chunk_size, int) or isinstance(chunk_size, bool)) else gr.update()
+    overlap_update = gr.update(value=ov) if (not isinstance(overlap, int) or isinstance(overlap, bool)) else gr.update()
+    return chunk_update, overlap_update, "Chunk Size 与 Temporal Overlap 设置正常。"
 
 def _on_max_resolution_change(resolution: Any, max_resolution: Any) -> str:
     try:
-        r, m = int(float(resolution)), int(float(max_resolution))
+        r = _strict_int(resolution, "resolution")
+        m = _strict_int(max_resolution, "max_resolution")
+        if not 1 <= r <= 16384 or not 0 <= m <= 32768:
+            return "分辨率参数超出允许范围。"
         if m > 0 and m < r:
             return f"⚠️ 最大边长 {m}px 小于目标短边 {r}px，可能产生不符合预期的缩放限制；建议设为 0 或不小于 {r}。"
     except (TypeError, ValueError, OverflowError):
-        return "分辨率参数需要为整数。"
+        return "分辨率参数必须是合法整数。"
     return "分辨率设置正常。"
 
 
-def _strict_int(value: Any, key: str) -> int:
-    """Accept integer-like values but reject fractional, infinite and NaN inputs."""
-    number = float(value)
-    if not math.isfinite(number) or not number.is_integer():
-        raise ValueError(f"{key} 必须是整数。")
-    return int(number)
-
 
 def validate_settings(p: Dict[str, Any], cli_path: str, output_root: str, inputs: List[str]) -> List[str]:
-    errors: List[str] = []
+    # Keep this validator safe when called independently of the normal submit path.
+    p, normalization_errors = normalize_ui_parameters(p)
+    errors: List[str] = list(normalization_errors)
     cli = Path(str(cli_path or "")).expanduser()
     if not cli.is_file():
         errors.append(f"找不到 CLI：{cli}")
@@ -772,19 +918,10 @@ def validate_settings(p: Dict[str, Any], cli_path: str, output_root: str, inputs
         elif path.is_dir() and not any(x.is_file() and x.suffix.lower() in valid_ext for x in path.iterdir()):
             errors.append(f"目录中没有 CLI 支持的媒体文件：{path}")
 
-    int_ranges = {
-        "resolution": (1, 16384), "max_resolution": (0, 32768),
-        "seed": (-2147483648, 2147483647), "skip_first_frames": (0, 100000000),
-        "load_cap": (0, 100000000), "chunk_size": (0, 1000000),
-        "prepend_frames": (0, 10000), "temporal_overlap": (0, 10000),
-        "blocks_to_swap": (0, 36), "vae_encode_tile_size": (64, 8192),
-        "vae_decode_tile_size": (64, 8192), "vae_encode_tile_overlap": (0, 8191),
-        "vae_decode_tile_overlap": (0, 8191),
-        "compile_dynamo_cache_size_limit": (1, 100000),
-        "compile_dynamo_recompile_limit": (1, 100000),
-    }
     parsed: Dict[str, int] = {}
-    for key, (minimum, maximum) in int_ranges.items():
+    for key, (minimum, maximum) in INT_PARAMETER_RANGES.items():
+        if key == "batch_size":
+            continue  # Validated separately below, including the 4n+1 constraint.
         try:
             value = _strict_int(p.get(key), key)
             parsed[key] = value
@@ -810,13 +947,13 @@ def validate_settings(p: Dict[str, Any], cli_path: str, output_root: str, inputs
     if parsed.get("blocks_to_swap", 0) > model_block_limit:
         errors.append(f"当前模型 BlockSwap 上限为 {model_block_limit}。")
 
-    for key in ("input_noise_scale", "latent_noise_scale"):
+    for key, (minimum, maximum) in FLOAT_PARAMETER_RANGES.items():
         try:
-            value = float(p.get(key))
-            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-                errors.append(f"{key} 必须在 0.0 到 1.0 之间。")
+            value = _strict_float(p.get(key), key)
+            if not minimum <= value <= maximum:
+                errors.append(f"{key} 必须在 {minimum} 到 {maximum} 之间。")
         except Exception:
-            errors.append(f"{key} 必须是有效数值。")
+            errors.append(f"{key} 必须是有限数值（范围 {minimum}–{maximum}）。")
 
     if p.get("vae_encode_tiled") and parsed.get("vae_encode_tile_overlap", 0) >= parsed.get("vae_encode_tile_size", 64):
         errors.append("VAE Encode Tile Overlap 必须小于 Encode Tile Size。")
@@ -899,7 +1036,11 @@ def config_from_ui(values: List[Any]) -> Dict[str, Any]:
 
 
 def _settings_changed(key: str, value: Any) -> str:
-    return save_config_values({key: value})
+    try:
+        normalized = _normalize_parameter_value(key, value) if key in DEFAULTS else value
+    except (TypeError, ValueError, OverflowError) as exc:
+        return f"参数未保存：{key} 输入无效：{exc}"
+    return save_config_values({key: normalized})
 
 
 def _merge_uploads(files: Any, current_text: str) -> str:
@@ -942,14 +1083,29 @@ def _load_config_outputs(components: List[Any]) -> Tuple[Any, ...]:
 
 
 def _submit(input_paths_text: str, cli_path: str, output_root: str, *ui_params: Any) -> Tuple[str, Any, Any]:
-    p = config_from_ui(list(ui_params))
-    batch_update, batch_note = _normalise_batch_size(p.get("batch_size", 5))
-    corrected_batch = int(batch_update.get("value", 5))
-    p["batch_size"] = corrected_batch
+    raw_params = config_from_ui(list(ui_params))
+
+    # Keep the established Batch Size auto-correction, then normalize all fields.
+    batch_update, batch_note = _normalise_batch_size(raw_params.get("batch_size", DEFAULTS["batch_size"]), persist=False)
+    corrected_batch = _strict_int(batch_update.get("value", DEFAULTS["batch_size"]), "batch_size")
+    raw_params["batch_size"] = corrected_batch
+    p, normalization_errors = normalize_ui_parameters(raw_params)
+
     paths = split_input_paths(input_paths_text)
-    errors = validate_settings(p, cli_path, output_root, paths)
+    errors = normalization_errors
+    if not errors:
+        errors = validate_settings(p, cli_path, output_root, paths)
     if errors:
-        return "❌ 提交失败：\n" + "\n".join(f"• {x}" for x in errors) + f"\n\n{batch_note}", gr.update(choices=_history_choices()), gr.update(value=corrected_batch)
+        return (
+            "❌ 提交失败，未调用 SeedVR2 Runtime：\n"
+            + "\n".join(f"• {x}" for x in errors)
+            + f"\n\n{batch_note}",
+            gr.update(choices=_history_choices()),
+            gr.update(value=corrected_batch),
+        )
+
+    # p now contains native Python int/float/bool/str values. This exact dictionary
+    # is persisted and passed to InProcessTaskManager; do not pass raw Gradio values.
     saved = {"cli_path": cli_path, "input_paths": input_paths_text, "output_root": output_root, **p}
     save_note = save_config_values(saved)
     count, message = MANAGER.submit(paths, p, cli_path, output_root)
@@ -1012,9 +1168,11 @@ def _preview(input_paths_text: str, cli_path: str, output_root: str, *ui_params:
     paths = split_input_paths(input_paths_text)
     if not paths:
         return "请先填写输入路径。"
-    p = config_from_ui(list(ui_params))
-    keep = bool(p.get("keep_models_resident", True))
-    chunk = int(float(p.get("chunk_size", 0) or 0))
+    p, parameter_errors = normalize_ui_parameters(config_from_ui(list(ui_params)))
+    if parameter_errors:
+        return "### 参数预检查未通过\n" + "\n".join(f"- {x}" for x in parameter_errors)
+    keep = p.get("keep_models_resident", True)
+    chunk = p["chunk_size"]
     devices = [x.strip() for x in str(p.get("cuda_device", "") or "0").split(",") if x.strip()]
     single_gpu = len(devices) <= 1
     plan = (
@@ -1040,8 +1198,9 @@ def _restore_history(record_id: str) -> Tuple[Any, ...]:
     if not rec:
         return tuple([gr.update()] * (3 + len(PARAM_KEYS)) + ["未选择有效历史记录。"])
     params = rec.get("params", {})
+    restored_params, restore_errors = normalize_ui_parameters(params)
     values = [rec.get("cli_path", str(DEFAULT_CLI)), rec.get("input", ""), rec.get("output_root", str(APP_DIR / "outputs"))]
-    values.extend(params.get(k, DEFAULTS[k]) for k in PARAM_KEYS)
+    values.extend(restored_params.get(k, DEFAULTS[k]) for k in PARAM_KEYS)
     restored_model = params.get("dit_model", DEFAULTS["dit_model"])
     choices = load_model_choices(Path(values[0]).expanduser().resolve())
     model_component_index = 3 + PARAM_KEYS.index("dit_model")
@@ -1051,7 +1210,10 @@ def _restore_history(record_id: str) -> Tuple[Any, ...]:
     save_values = {k: v for k, v in zip(PARAM_KEYS, values[3:])}
     save_values["dit_model"] = restored_model
     save_config_values({"cli_path": values[0], "input_paths": values[1], "output_root": values[2], **save_values})
-    return tuple(values + [f"已将历史任务 {rec.get('id')} 的输入与参数恢复到工作区。"])
+    restore_note = f"已将历史任务 {rec.get('id')} 的输入与参数恢复到工作区。"
+    if restore_errors:
+        restore_note += " 以下历史参数无效，已回退默认值：" + "；".join(restore_errors)
+    return tuple(values + [restore_note])
 
 
 def _delete_history(record_id: str, confirmed: bool) -> Tuple[str, Any, Any]:
@@ -1190,6 +1352,7 @@ def build_app() -> gr.Blocks:
                     comps["input_noise_scale"] = gr.Slider(label="Input Noise Scale", minimum=0, maximum=1, step=.01, value=cfg.get("input_noise_scale", 0.0), info="输入图像噪声注入强度，范围 0–1；较大值可能改变细节。")
                     comps["latent_noise_scale"] = gr.Slider(label="Latent Noise Scale", minimum=0, maximum=1, step=.01, value=cfg.get("latent_noise_scale", 0.0), info="潜空间噪声注入强度，范围 0–1；建议从 0 开始比较。")
                 resolution_hint = gr.Markdown("分辨率设置正常。")
+                parameter_validation_status = gr.Markdown("数值参数校验：手动输入后会自动转换类型；不合法的值不会保存或提交。")
             with gr.Tab("设备与显存优化"):
                 gr.Markdown(f"<div class='seed-muted'>本机设备检测：{html.escape(device_info.get('note', ''))} · 可手动输入自定义设备值；CUDA 设备 ID 由 CLI 传递。</div>")
                 with gr.Row():
@@ -1236,7 +1399,16 @@ def build_app() -> gr.Blocks:
         # Save every field after an actual user change. Explicit callback functions below
         # handle coupled values and write corrected values back to the config.
         for key, component in comps.items():
-            if key not in LINKED_AUTOSAVE_KEYS:
+            if key in LINKED_AUTOSAVE_KEYS:
+                continue  # Their coupled callbacks below validate and persist canonical values.
+            if key in NUMERIC_PARAMETER_KEYS:
+                component.change(
+                    fn=lambda value, k=key: _on_numeric_parameter_change(k, value),
+                    inputs=component,
+                    outputs=[component, parameter_validation_status],
+                    queue=False,
+                )
+            else:
                 component.change(fn=lambda value, k=key: _settings_changed(k, value), inputs=component, outputs=None, queue=False)
         for component, key in [(cli_path, "cli_path"), (input_paths, "input_paths"), (output_root, "output_root")]:
             component.change(fn=lambda value, k=key: _settings_changed(k, value), inputs=component, outputs=None, queue=False)
@@ -1338,11 +1510,16 @@ def build_app() -> gr.Blocks:
         delete_btn.click(_delete_history, inputs=[history_select, delete_confirm], outputs=[history_status, history_select, delete_confirm], queue=False)
         clear_btn.click(_clear_history, inputs=clear_confirm, outputs=[history_status, history_select, clear_confirm], queue=False)
 
-        def save_all(input_value: str, cli_value: str, output_value: str, *vals: Any) -> str:
-            data = {"cli_path": cli_value, "input_paths": input_value, "output_root": output_value}
-            data.update(config_from_ui(list(vals)))
-            return save_config_values(data)
-        save_btn.click(save_all, inputs=[input_paths, cli_path, output_root] + param_components, outputs=autosave_status, queue=False)
+        def save_all(input_value: str, cli_value: str, output_value: str, *vals: Any) -> Tuple[str, Any]:
+            raw = config_from_ui(list(vals))
+            batch_update, batch_note = _normalise_batch_size(raw.get("batch_size", DEFAULTS["batch_size"]), persist=False)
+            raw["batch_size"] = _strict_int(batch_update.get("value", DEFAULTS["batch_size"]), "batch_size")
+            normalized, errors = normalize_ui_parameters(raw)
+            if errors:
+                return "❌ 配置未保存，存在无效参数：\n" + "\n".join(f"- {x}" for x in errors), gr.update()
+            data = {"cli_path": cli_value, "input_paths": input_value, "output_root": output_value, **normalized}
+            return save_config_values(data) + "\n" + batch_note, batch_update
+        save_btn.click(save_all, inputs=[input_paths, cli_path, output_root] + param_components, outputs=[autosave_status, comps["batch_size"]], queue=False)
 
         load_outputs = [cli_path, input_paths, output_root] + param_components + [startup_status]
         demo.load(lambda: _load_config_outputs(load_outputs), outputs=load_outputs, queue=False)
